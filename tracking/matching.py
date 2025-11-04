@@ -63,7 +63,7 @@ def associate_detections_to_tracks(tracks, detections, threshold, aw_off, grid_o
             emb_cost = split_cosine_dist(det_embs, trks_embs)
             emb_cost = emb_cost.T
         w_assoc_emb = 0.75
-        aw_param = 0.5
+        aw_param = 0.4
 
     matches = []
     if not det_app:
@@ -161,7 +161,7 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
         else:
             emb_cost = split_cosine_dist(det_embs, trks_embs)
         w_assoc_emb = 0.75
-        aw_param = 0.5
+        aw_param = 0.4
 
     matches = []
     if not det_app:

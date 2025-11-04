@@ -32,8 +32,16 @@ class Track_3D:
         self.time_since_update = 0
         self.fusion_time_update = 0
         self.confidence = 0.97
-        self.con1 = 0.97
+        self.con1 = 0.96
         self.emb = emb
+        
+        # ========== 方案3: 多帧回溯 - 速度历史 ==========
+        self.velocity_history = []  # [(frame_id, velocity), ...]
+        self.max_history_length = 5  # 保留最近5帧
+        
+        # 初始化第一帧速度
+        initial_velocity = self.kf_3d.kf.x[7:10].flatten()
+        self.velocity_history.append((self.age, initial_velocity.copy()))
 
     def predict_3d(self, trk_3d):
         self.pose = trk_3d.predict()
@@ -52,6 +60,14 @@ class Track_3D:
             self.state = TrackState.Tentative
         if  self.fusion_time_update >= 3:
             self.state = TrackState.Reactivate
+        
+        # ========== 方案3: 记录速度历史 ==========
+        current_velocity = self.kf_3d.kf.x[7:10].flatten()
+        self.velocity_history.append((self.age, current_velocity.copy()))
+        
+        # 保持历史长度
+        if len(self.velocity_history) > self.max_history_length:
+            self.velocity_history.pop(0)
 
     def update_emb(self, emb, alpha=0.9):
         self.emb = alpha * self.emb + (1 - alpha) * emb
@@ -96,3 +112,67 @@ class Track_3D:
 
     def get_emb(self):
         return self.emb
+    
+    # ========== 方案3: 多帧回溯 - 新增方法 ==========
+    
+    def get_velocity_trend(self):
+        """
+        获取速度趋势 (加速度)
+        使用最近两帧计算，降低噪声影响
+        
+        Returns:
+            trend: 速度变化趋势 [dvx, dvy, dvz] (m/s per frame)
+        """
+        if len(self.velocity_history) < 2:
+            return np.zeros(3)
+        
+        # 使用最近两帧计算趋势
+        recent_vel = self.velocity_history[-1][1]
+        prev_vel = self.velocity_history[-2][1]
+        
+        # 速度变化率
+        trend = recent_vel - prev_vel
+        
+        return trend
+    
+    def get_average_velocity(self, window=3):
+        """
+        获取平均速度 (平滑，降低噪声)
+        
+        Args:
+            window: 平均窗口大小 (默认3帧)
+        
+        Returns:
+            avg_velocity: 平均速度 [vx, vy, vz]
+        """
+        if len(self.velocity_history) == 0:
+            return np.zeros(3)
+        
+        # 取最近window帧的平均
+        recent_vels = [v[1] for v in self.velocity_history[-window:]]
+        avg_velocity = np.mean(recent_vels, axis=0)
+        
+        return avg_velocity
+    
+    def get_smooth_velocity_trend(self, window=3):
+        """
+        获取平滑的速度趋势 (降低噪声)
+        使用平滑后的速度计算趋势
+        
+        Args:
+            window: 平滑窗口大小
+        
+        Returns:
+            smooth_trend: 平滑后的速度趋势
+        """
+        if len(self.velocity_history) < window + 1:
+            return np.zeros(3)
+        
+        # 计算两个时间段的平均速度
+        recent_avg = np.mean([v[1] for v in self.velocity_history[-window:]], axis=0)
+        prev_avg = np.mean([v[1] for v in self.velocity_history[-window-1:-1]], axis=0)
+        
+        # 平滑趋势
+        smooth_trend = recent_avg - prev_avg
+        
+        return smooth_trend

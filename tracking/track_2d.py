@@ -34,7 +34,7 @@ class Track_2D:
         self.n_init = n_init    # 连续n_init帧被检测到，状态就被设为confirmed
         self._max_age = max_age  # 一个跟踪对象丢失多少帧后会被删去（删去之后将不再进行特征匹配）\
         self.confidence = 0.97
-        self.con1 = 0.97
+        self.con1 = 0.96
         self.emb = emb
     def to_tlwh(self):
         """

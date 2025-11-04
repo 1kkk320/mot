@@ -117,9 +117,9 @@ class DeepFusion(object):
 
 def main():
     # Define the file name
-    data_root = 'datasets\kitti\\test'
-    detections_name_3D = '3D_pointrcnn_Car'
-    detections_name_2D = '2D_rrc_Car'
+    data_root = 'datasets/kitti/train'
+    detections_name_3D = '3D_virconv'  # CenterPoint 3D（LiDAR坐标）
+    detections_name_2D = '2D_rrc_Car'  # CenterPoint 2D（投影）
 
     # Define the file path
     calib_root = os.path.join(data_root, 'calib')     #矫正数据
@@ -128,7 +128,7 @@ def main():
     detections_root_2D = os.path.join(data_root, detections_name_2D)
 
     # Define the file path of results.
-    save_root = 'results/car_testlowiou2'   # The root directory where the result is saved
+    save_root = 'results/virconv'  # CenterPoint（LiDAR坐标，仅评估）
     txt_path_0 = os.path.join(save_root, 'data'); mkdir_if_inexistence(txt_path_0)
     image_path_0 = os.path.join(save_root, 'image'); mkdir_if_inexistence(image_path_0)
 
@@ -143,7 +143,7 @@ def main():
     image_file_list, _ = load_list_from_folder(image_files, dataset_dir)
 
     total_time, total_frames, i = 0.0, 0, 0  # Tracker runtime, total frames and Serial number of the dataset、跟踪器运行时，总时间、总帧数和数据集的序列号
-    tracker = DeepFusion(max_age=25, min_hits=3)  # Tracker initialization
+    tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.3)  # 降低阈值以容忍 3D-2D 不对齐
 
     # Iterate through each data set 遍历数据集
     for seq_file_3D, image_filename in zip(detection_file_list_3D, image_files):
@@ -161,6 +161,18 @@ def main():
         image_filenames = [join(image_dir, x) for x in listdir(image_dir) if is_image_file(x)]
         seq_dets_3D = np.loadtxt(seq_file_3D, delimiter=',')  # load 3D detections, N x 15
         seq_dets_2D = np.loadtxt(seq_file_2D, delimiter=',')  # load 2D detections, N x 6
+        
+        # 跳过空文件
+        if seq_dets_3D.size == 0 or seq_dets_2D.size == 0:
+            print(f"⚠️  序列 {image_filename} 检测为空，跳过")
+            i += 1
+            continue
+        
+        # 确保是 2D 数组
+        if seq_dets_3D.ndim == 1:
+            seq_dets_3D = seq_dets_3D.reshape(1, -1)
+        if seq_dets_2D.ndim == 1:
+            seq_dets_2D = seq_dets_2D.reshape(1, -1)
 
         min_frame, max_frame = int(seq_dets_3D[:, 0].min()), len(image_filenames)
 
@@ -220,7 +232,7 @@ def main():
                                 bbox2d_tmp_trk[1],bbox2d_tmp_trk[2],bbox2d_tmp_trk[3],bbox3d_tmp[0], bbox3d_tmp[1],bbox3d_tmp[2], bbox3d_tmp[3],
                                 bbox3d_tmp[4], bbox3d_tmp[5],bbox3d_tmp[6],conf_tmp)
                         f.write(str_to_srite)
-                        show_image_with_boxes(img_0, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)
+                        # show_image_with_boxes(img_0, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
             # if len(trackers_2d) > 0:
             #     for d in trackers_2d:
             #         bbox2d = d.flatten()

@@ -22,7 +22,12 @@ def iou_batch(boxA, boxB):
     boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
     boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
 
-    iou = interArea / float(boxAArea + boxBArea - interArea)
+    # 防止除零错误
+    denominator = float(boxAArea + boxBArea - interArea)
+    if denominator == 0:
+        return 0.0
+    
+    iou = interArea / denominator
 
     return iou
 
@@ -188,3 +193,158 @@ def convert_3dbox_to_8corner(bbox3d_input):
     corners_3d[2, :] = corners_3d[2, :] + bbox3d[2]  # z
 
     return np.transpose(corners_3d)
+
+
+# ==================== 速度自适应回溯关联相关函数 ====================
+
+def get_velocity(track):
+    """
+    从卡尔曼滤波器提取速度
+    
+    Args:
+        track: Track_3D对象
+    
+    Returns:
+        velocity: [dx, dy, dz] 速度向量 (m/s)
+    """
+    if hasattr(track, 'kf_3d') and hasattr(track.kf_3d, 'kf'):
+        # 提取速度状态 (索引7,8,9对应dx,dy,dz)
+        velocity = track.kf_3d.kf.x[7:10].flatten()
+        return velocity
+    else:
+        return np.zeros(3)
+
+
+def compute_velocity_similarity(track_vel, det_vel, alpha=1.0):
+    """
+    计算速度相似度 (余弦相似度)
+    
+    Args:
+        track_vel: 轨迹速度 [dx, dy, dz]
+        det_vel: 检测速度 (从历史估计) [dx, dy, dz]
+        alpha: 速度权重系数 (保留用于未来扩展)
+    
+    Returns:
+        similarity: 速度相似度 (0-1), 1表示完全相同
+    """
+    # 计算速度大小
+    norm_track = np.linalg.norm(track_vel)
+    norm_det = np.linalg.norm(det_vel)
+    
+    # 如果速度太小(接近静止),返回中等相似度
+    if norm_track < 1e-6 or norm_det < 1e-6:
+        return 0.5
+    
+    # 余弦相似度: cos(θ) = (a·b) / (|a||b|)
+    cos_sim = np.dot(track_vel, det_vel) / (norm_track * norm_det)
+    
+    # 归一化到[0,1]: cos从[-1,1]映射到[0,1]
+    similarity = (cos_sim + 1) / 2
+    
+    return similarity
+
+
+def estimate_detection_velocity(detection, prev_detections, frame_id):
+    """
+    从历史检测估计当前检测的速度
+    
+    Args:
+        detection: 当前检测对象
+        prev_detections: 历史检测字典 {frame_id: [detections]}
+        frame_id: 当前帧ID
+    
+    Returns:
+        velocity: 估计的速度 [dx, dy, dz] (m/s)
+    """
+    # 如果没有历史帧,返回零速度
+    if frame_id - 1 not in prev_detections:
+        return np.zeros(3)
+    
+    # 获取上一帧的检测
+    prev_frame_dets = prev_detections[frame_id - 1]
+    
+    # 寻找最近的历史检测 (基于位置距离)
+    min_dist = float('inf')
+    best_match = None
+    
+    for prev_det in prev_frame_dets:
+        # 计算3D位置距离
+        dist = np.linalg.norm(detection.bbox[:3] - prev_det.bbox[:3])
+        if dist < min_dist:
+            min_dist = dist
+            best_match = prev_det
+    
+    # 如果找到匹配且距离合理(小于5米)
+    if best_match is not None and min_dist < 5.0:
+        # 计算速度: v = Δs / Δt
+        # 假设KITTI数据集帧率为10Hz, dt=0.1s
+        velocity = (detection.bbox[:3] - best_match.bbox[:3]) / 0.1
+        return velocity
+    else:
+        # 没有找到合理的匹配,返回零速度
+        return np.zeros(3)
+
+
+# ========== 方案3: 多帧回溯 - 新增函数 ==========
+
+def compute_velocity_trend_similarity(track, det_vel, use_smooth=True):
+    """
+    基于速度趋势的相似度 (方案3)
+    考虑加速度，预测下一帧速度
+    
+    Args:
+        track: 轨迹对象
+        det_vel: 检测速度
+        use_smooth: 是否使用平滑趋势 (降低噪声)
+    
+    Returns:
+        similarity: 趋势相似度 [0, 1]
+    """
+    # 获取轨迹当前速度
+    trk_vel = get_velocity(track)
+    
+    # 获取速度趋势 (加速度)
+    if use_smooth and hasattr(track, 'get_smooth_velocity_trend'):
+        # 使用平滑趋势 (降低噪声)
+        trk_trend = track.get_smooth_velocity_trend(window=3)
+    elif hasattr(track, 'get_velocity_trend'):
+        # 使用简单趋势
+        trk_trend = track.get_velocity_trend()
+    else:
+        # 如果没有趋势信息，退化为普通速度相似度
+        return compute_velocity_similarity(trk_vel, det_vel)
+    
+    # 预测下一帧速度 (考虑加速度)
+    # dt = 0.1s (假设10Hz帧率)
+    predicted_vel = trk_vel + trk_trend * 0.1
+    
+    # 计算与检测速度的相似度
+    similarity = compute_velocity_similarity(predicted_vel, det_vel)
+    
+    return similarity
+
+
+def compute_smooth_velocity_similarity(track, det_vel, window=3):
+    """
+    基于平滑速度的相似度 (方案3)
+    使用多帧平均速度，降低噪声影响
+    
+    Args:
+        track: 轨迹对象
+        det_vel: 检测速度
+        window: 平滑窗口大小
+    
+    Returns:
+        similarity: 相似度 [0, 1]
+    """
+    # 使用平均速度 (更稳定)
+    if hasattr(track, 'get_average_velocity'):
+        avg_vel = track.get_average_velocity(window)
+    else:
+        # 退化为当前速度
+        avg_vel = get_velocity(track)
+    
+    # 计算相似度
+    similarity = compute_velocity_similarity(avg_vel, det_vel)
+    
+    return similarity
