@@ -3,6 +3,8 @@
 import numpy as np
 from tracking.cost_function import iou3d, convert_3dbox_to_8corner, iou_batch, eucliDistance
 import scipy.spatial as sp
+from tracking.cost_matrix_fusion import compute_fused_cost_matrix
+from copy import deepcopy
 
 
 def split_cosine_dist(dets, trks, affinity_thresh=0.55, pair_diff_thresh=0.6, hard_thresh=True):
@@ -11,8 +13,22 @@ def split_cosine_dist(dets, trks, affinity_thresh=0.55, pair_diff_thresh=0.6, ha
 
     for i in range(len(dets)):
         for j in range(len(trks)):
+            # 兼容一维向量/二维patch：统一转换为二维行向量
+            det_ij = np.asarray(dets[i])
+            trk_ij = np.asarray(trks[j])
+            if det_ij.ndim == 1:
+                det_ij = det_ij[None, :]
+            if trk_ij.ndim == 1:
+                trk_ij = trk_ij[None, :]
+            # 统一特征维度：使用双方共同的最小维度
+            d_dim = det_ij.shape[1]
+            t_dim = trk_ij.shape[1]
+            if d_dim != t_dim:
+                min_dim = min(d_dim, t_dim)
+                det_ij = det_ij[:, :min_dim]
+                trk_ij = trk_ij[:, :min_dim]
 
-            cos_d = 1 - sp.distance.cdist(dets[i], trks[j], "cosine")  ## shape = 3x3
+            cos_d = 1 - sp.distance.cdist(det_ij, trk_ij, "cosine")  ## shape = [m_d, m_t]
             patch_affinity = np.max(cos_d, axis=0)  ## shape = [3,]
             # exp16 - Using Hard threshold
             if hard_thresh:
@@ -118,7 +134,7 @@ def associate_detections_to_tracks(tracks, detections, threshold, aw_off, grid_o
         matches = np.concatenate(matches, axis=0)
 
     return matches, np.array(unmatched_trackers), np.array(unmatched_detections)
-def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_off,mot_off, iou_threshold, det_embs=None, det_app = False):
+def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_off, mot_off, iou_threshold, det_embs=None, det_app=False, angle_config=None, enable_angle=False, appearance_weight=None):
     """
     Assigns detections to tracked object (both represented as bounding boxes)
     将检测分配给跟踪的对象（均表示为边界框）
@@ -155,7 +171,7 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
             # 	iou_matrix[d, t] = 0
 
     if not det_app:
-        # 计算外观特征
+        # 计算外观特征相似度矩阵 (dets x trks)
         if grid_off:
             emb_cost = None if (trks_embs.shape[0] == 0 or det_embs.shape[0] == 0) else det_embs @ trks_embs.T
         else:
@@ -164,34 +180,88 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
         aw_param = 0.4
 
     matches = []
-    if not det_app:
-        if min(iou_matrix.shape) > 0:
-            a = (iou_matrix > iou_threshold).astype(np.int32)
-            if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-                matched_indices = np.stack(np.where(a),axis=1)
-            else:
+    if min(iou_matrix.shape) > 0:
+        # 可选的快速唯一匹配分支（基于IoU阈值）
+        a = (iou_matrix > iou_threshold).astype(np.int32)
+        if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+            matched_indices = np.stack(np.where(a), axis=1)
+        else:
+            # 自适应外观加权
+            app_matrix_det_trk = None
+            if not det_app and emb_cost is not None and emb_cost.size > 0:
                 if not aw_off:
                     w_matrix = compute_aw_new_metric(emb_cost, w_assoc_emb, aw_param)
-                    emb_cost *= w_matrix
+                    emb_cost = emb_cost * w_matrix
                 else:
-                    emb_cost *= w_assoc_emb
-                if not mot_off:
-                    final_cost = -(iou_matrix+emb_cost)
-                    matched_indices = linear_assignment(final_cost)
-                else:
-                    final_cost = -emb_cost
-                    matched_indices = linear_assignment(final_cost)
-        else:
-            matched_indices = np.empty(shape=(0, 2))
+                    emb_cost = emb_cost * w_assoc_emb
+                app_matrix_det_trk = emb_cost
+
+            w_app = 0.0
+            appearance_reliable = False
+            if (not det_app) and (app_matrix_det_trk is not None) and (app_matrix_det_trk.size > 0):
+                A = app_matrix_det_trk
+                row_ratio = 0.0
+                col_ratio = 0.0
+                if A.shape[1] >= 2:
+                    sr = np.sort(A, axis=1)
+                    top1 = sr[:, -1]
+                    top2 = sr[:, -2]
+                    row_ok = ((top1 - top2) >= 0.10) & (top1 >= 0.5)
+                    row_ratio = row_ok.mean() if row_ok.size > 0 else 0.0
+                B = A.T
+                if B.shape[1] >= 2:
+                    sc = np.sort(B, axis=1)
+                    t1 = sc[:, -1]
+                    t2 = sc[:, -2]
+                    col_ok = ((t1 - t2) >= 0.10) & (t1 >= 0.5)
+                    col_ratio = col_ok.mean() if col_ok.size > 0 else 0.0
+                appearance_reliable = (row_ratio >= 0.3 and col_ratio >= 0.3) or (row_ratio >= 0.5 or col_ratio >= 0.5)
+                if appearance_reliable:
+                    w_app = appearance_weight if (appearance_weight is not None) else 0.10
+                    if w_app > 0.15:
+                        w_app = 0.15
+                    if w_app < 0.0:
+                        w_app = 0.0
+            angle_cfg_for_call = angle_config
+            if angle_config is not None:
+                try:
+                    angle_cfg_for_call = deepcopy(angle_config)
+                except Exception:
+                    angle_cfg_for_call = angle_config
+                if hasattr(angle_cfg_for_call, 'enable_angle_feature'):
+                    angle_cfg_for_call.enable_angle_feature = True
+                if hasattr(angle_cfg_for_call, 'angle_cost_sigma'):
+                    angle_cfg_for_call.angle_cost_sigma = 0.35
+                if hasattr(angle_cfg_for_call, 'angle_weight'):
+                    angle_cfg_for_call.angle_weight = 0.25
+            residual = max(0.0, 1.0 - w_app)
+            w_iou = residual * 0.75
+            w_ang = residual * 0.25
+            weights = {
+                'iou': w_iou,
+                'velocity': 0.0,
+                'appearance': w_app,
+                'angle': w_ang
+            }
+            total_w = w_app + w_iou + w_ang
+            print(f"[L1 Weights] w_app={w_app:.3f}, w_iou={w_iou:.3f}, w_ang={w_ang:.3f}, sum={total_w:.3f}")
+
+            fused_cost, angle_cost, gate_mask = compute_fused_cost_matrix(
+                trackers,
+                detections,
+                iou_matrix=iou_matrix.T,  # 转为 (trks x dets)
+                velocity_matrix=None,
+                appearance_matrix=(app_matrix_det_trk.T if (not det_app and app_matrix_det_trk is not None) else None),
+                angle_config=(angle_cfg_for_call if enable_angle else None),
+                weights=weights,
+                verbose=False
+            )
+
+            # 赋值为 (dets x trks) 供 linear_assignment 使用
+            final_cost = fused_cost.T
+            matched_indices = linear_assignment(final_cost)
     else:
-        if min(iou_matrix.shape) > 0:
-            a = (iou_matrix > iou_threshold).astype(np.int32)
-            if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-                matched_indices = np.stack(np.where(a), axis=1)
-            else:
-                matched_indices = linear_assignment(-iou_matrix)
-        else:
-            matched_indices = np.empty(shape=(0, 2))
+        matched_indices = np.empty(shape=(0, 2))
 
     unmatched_detections = []
     for d, det in enumerate(dets_8corner):

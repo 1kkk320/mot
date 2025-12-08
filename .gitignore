@@ -1,0 +1,36 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.venv/
+env/
+venv/
+.env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & results
+logs/
+*.log
+results/
+outputs/
+runs/
+experiments/
+
+# Checkpoints / large artifacts
+checkpoints/
+weights/
+models/
+*.pt
+*.pth
+*.onnx
+
+# Local datasets (按需调整你的本地数据目录名)
+data/
+datasets/
+kitti/
+KITTI/

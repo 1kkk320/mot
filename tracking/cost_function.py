@@ -348,3 +348,12 @@ def compute_smooth_velocity_similarity(track, det_vel, window=3):
     similarity = compute_velocity_similarity(avg_vel, det_vel)
     
     return similarity
+
+
+def compute_adaptive_weight_linear(track_velocity, v_max=10.0):
+    speed = float(np.linalg.norm(track_velocity))
+    if v_max is None or v_max <= 1e-6:
+        v_max = 1.0
+    w_vel = min(speed / float(v_max), 1.0)
+    w_pos = 1.0 - w_vel
+    return w_vel, w_pos

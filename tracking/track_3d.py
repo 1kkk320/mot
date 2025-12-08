@@ -139,6 +139,9 @@ class Track_3D:
         """
         获取平均速度 (平滑，降低噪声)
         
+        修复版本: 考虑缺失帧的帧差
+        当velocity_history中有缺失帧时，使用加权平均而不是简单平均
+        
         Args:
             window: 平均窗口大小 (默认3帧)
         
@@ -148,31 +151,68 @@ class Track_3D:
         if len(self.velocity_history) == 0:
             return np.zeros(3)
         
-        # 取最近window帧的平均
-        recent_vels = [v[1] for v in self.velocity_history[-window:]]
-        avg_velocity = np.mean(recent_vels, axis=0)
+        if len(self.velocity_history) < window:
+            # 历史不足，返回最后一帧速度
+            return self.velocity_history[-1][1]
+        
+        # 获取最近window帧
+        recent_vels = self.velocity_history[-window:]
+        
+        # 计算实际帧差 (考虑缺失帧)
+        frame_indices = [v[0] for v in recent_vels]
+        frame_diff = frame_indices[-1] - frame_indices[0]
+        
+        if frame_diff == 0:
+            return recent_vels[-1][1]
+        
+        # 提取速度向量
+        velocities = np.array([v[1] for v in recent_vels])
+        
+        # 加权平均: 越近的帧权重越高
+        weights = np.linspace(1, window, window) / (window * (window + 1) / 2)
+        weights = weights.reshape(-1, 1)  # 转换为列向量以支持广播
+        
+        avg_velocity = np.average(velocities, axis=0, weights=weights.flatten())
         
         return avg_velocity
     
     def get_smooth_velocity_trend(self, window=3):
         """
         获取平滑的速度趋势 (降低噪声)
-        使用平滑后的速度计算趋势
+        
+        修复版本: 使用实际帧差计算加速度
+        当velocity_history中有缺失帧时，使用实际帧差而不是假设固定帧间隔
         
         Args:
             window: 平滑窗口大小
         
         Returns:
-            smooth_trend: 平滑后的速度趋势
+            smooth_trend: 平滑后的速度趋势 (加速度)
         """
-        if len(self.velocity_history) < window + 1:
+        if len(self.velocity_history) < 2:
             return np.zeros(3)
         
-        # 计算两个时间段的平均速度
-        recent_avg = np.mean([v[1] for v in self.velocity_history[-window:]], axis=0)
-        prev_avg = np.mean([v[1] for v in self.velocity_history[-window-1:-1]], axis=0)
+        if len(self.velocity_history) < window + 1:
+            # 历史不足，使用最近两帧计算
+            v_new = self.velocity_history[-1][1]
+            v_old = self.velocity_history[0][1]
+            frame_new = self.velocity_history[-1][0]
+            frame_old = self.velocity_history[0][0]
+        else:
+            # 使用window大小的窗口
+            v_new = self.velocity_history[-1][1]
+            v_old = self.velocity_history[-window][1]
+            frame_new = self.velocity_history[-1][0]
+            frame_old = self.velocity_history[-window][0]
         
-        # 平滑趋势
-        smooth_trend = recent_avg - prev_avg
+        # 计算实际帧差 (考虑缺失帧)
+        frame_diff = frame_new - frame_old
+        
+        if frame_diff == 0:
+            return np.zeros(3)
+        
+        # 加速度 = 速度变化 / 帧差
+        # 这样可以正确处理缺失帧的情况
+        smooth_trend = (v_new - v_old) / frame_diff
         
         return smooth_trend
