@@ -66,7 +66,8 @@ def fuse_cost_matrices(cost_dict, weights, normalize=True, verbose=False):
     
     Args:
         cost_dict: 代价字典 {'iou': matrix, 'velocity': matrix, 'appearance': matrix, 'angle': matrix}
-        weights: 权重字典 {'iou': w_iou, 'velocity': w_vel, 'appearance': w_app, 'angle': w_ang}
+        weights: 权重字典，值可以是标量或与代价矩阵同形状的矩阵
+                 例如 {'iou': 0.4, 'velocity': 0.0, 'appearance': 0.15, 'angle': w_ang_matrix}
         normalize: 是否先归一化各个代价矩阵
         verbose: 是否打印调试信息
         
@@ -83,17 +84,20 @@ def fuse_cost_matrices(cost_dict, weights, normalize=True, verbose=False):
     if shape is None:
         return np.array([])
     
-    # 初始化融合矩阵
-    fused_cost = np.zeros(shape)
-    total_weight = 0.0
+    # 初始化融合矩阵与逐元素权重和
+    fused_cost = np.zeros(shape, dtype=np.float32)
+    weight_sum = np.zeros(shape, dtype=np.float32)
     
     # 融合各个特征
     for feature_name, cost_matrix in cost_dict.items():
         if cost_matrix is None or cost_matrix.size == 0:
             continue
         
-        weight = weights.get(feature_name, 0.0)
-        if weight <= 0:
+        # 支持标量或矩阵权重（尝试广播到目标形状）
+        w_val = weights.get(feature_name, 0.0)
+        try:
+            w_mat = np.broadcast_to(np.asarray(w_val, dtype=np.float32), shape)
+        except Exception:
             continue
         
         # 归一化
@@ -102,17 +106,20 @@ def fuse_cost_matrices(cost_dict, weights, normalize=True, verbose=False):
         else:
             normalized_cost = cost_matrix
         
-        # 加权融合
-        fused_cost += weight * normalized_cost
-        total_weight += weight
+        # 加权融合（逐元素）
+        fused_cost += w_mat * normalized_cost
+        weight_sum += w_mat
         
         if verbose:
-            print(f"[融合] {feature_name}: weight={weight:.3f}, "
+            w_disp = float(w_val) if np.isscalar(w_val) else float(np.mean(w_mat))
+            print(f"[融合] {feature_name}: weight~{w_disp:.3f}, "
                   f"cost_range=[{normalized_cost.min():.3f}, {normalized_cost.max():.3f}]")
     
-    # 归一化融合结果
-    if total_weight > 0:
-        fused_cost /= total_weight
+    # 逐元素归一化融合结果
+    eps = 1e-12
+    mask = weight_sum > eps
+    if np.any(mask):
+        fused_cost[mask] = fused_cost[mask] / weight_sum[mask]
     
     return fused_cost
 
@@ -129,7 +136,9 @@ def apply_angle_gate(cost_matrix, gate_mask):
         gated_cost: 应用门控后的代价矩阵
     """
     gated_cost = cost_matrix.copy()
-    gated_cost[~gate_mask] = np.inf  # 被拒绝的候选项设为无穷大
+    # 使用大有限值而不是 +inf，避免 scipy.optimize.linear_sum_assignment 报 "infeasible"
+    LARGE_COST = 1e6
+    gated_cost[~gate_mask] = LARGE_COST
     return gated_cost
 
 

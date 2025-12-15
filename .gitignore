@@ -34,3 +34,12 @@ data/
 datasets/
 kitti/
 KITTI/
+# Generated/old results
+results_test/
+results_val/
+archive/
+cache/
+
+# Backups and archives
+*.bak
+*.zip

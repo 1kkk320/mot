@@ -5,9 +5,10 @@ from tracking.cost_function import iou3d, convert_3dbox_to_8corner, iou_batch, e
 import scipy.spatial as sp
 from tracking.cost_matrix_fusion import compute_fused_cost_matrix
 from copy import deepcopy
+from tracking.adaptive_angle_weight import compute_adaptive_cost_matrix_weights
 
 
-def split_cosine_dist(dets, trks, affinity_thresh=0.55, pair_diff_thresh=0.6, hard_thresh=True):
+def split_cosine_dist(dets, trks, affinity_thresh=0.50, pair_diff_thresh=0.6, hard_thresh=True):
 
     cos_dist = np.zeros((len(dets), len(trks)))
 
@@ -61,7 +62,15 @@ def associate_detections_to_tracks(tracks, detections, threshold, aw_off, grid_o
         return [], track_indices, detection_indices  # Nothing to match.
 
     if not det_app:
-        trks_embs = np.asarray([trk_emb.emb.tolist() for trk_emb in tracks])
+        trks_list = []
+        for trk in tracks:
+            e = np.asarray(trk.emb) if hasattr(trk, 'emb') else None
+            if e is None:
+                trks_list.append(None)
+                continue
+            if e.ndim == 2:
+                e = e.mean(axis=0)
+            trks_list.append(e)
 
     iou_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float32)
     for t, trk in enumerate(tracks):
@@ -74,8 +83,27 @@ def associate_detections_to_tracks(tracks, detections, threshold, aw_off, grid_o
             #     iou_matrix[d, t] = 0
     if not det_app:
         if grid_off:
-            emb_cost = None if (trks_embs.shape[0] == 0 or det_embs.shape[0] == 0) else trks_embs @ det_embs.T
+            if det_embs is None or det_embs.size == 0 or len(trks_list) == 0:
+                emb_cost = None
+            else:
+                d_dim = det_embs.shape[1]
+                trk_embs_mat = np.zeros((len(trks_list), d_dim), dtype=np.float32)
+                for i, e in enumerate(trks_list):
+                    if e is None:
+                        continue
+                    if e.ndim == 1:
+                        if e.shape[0] == d_dim:
+                            trk_embs_mat[i] = e
+                        else:
+                            m = min(d_dim, e.shape[0])
+                            trk_embs_mat[i, :m] = e[:m]
+                    else:
+                        v = e.reshape(-1)
+                        m = min(d_dim, v.shape[0])
+                        trk_embs_mat[i, :m] = v[:m]
+                emb_cost = trk_embs_mat @ det_embs.T
         else:
+            trks_embs = np.asarray([np.asarray(e) if e is not None else np.zeros_like(det_embs[0]) for e in trks_list])
             emb_cost = split_cosine_dist(det_embs, trks_embs)
             emb_cost = emb_cost.T
         w_assoc_emb = 0.75
@@ -149,7 +177,9 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
     else:
         dets_8corner = []
 
-    trks_embs = np.asarray([trk_emb.emb.tolist() for trk_emb in trackers])
+    # 当关闭外观或轨迹未包含嵌入时，避免在此处访问 emb；
+    # 真正需要时在下面的具体分支中按需构建。
+    trks_embs = None
     trks_8corner = [convert_3dbox_to_8corner(trk_tmp.pose) for trk_tmp in trackers]
     trks_confidece = [trk.confidence for trk in trackers]
     if len(trks_8corner) > 0:
@@ -171,10 +201,29 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
             # 	iou_matrix[d, t] = 0
 
     if not det_app:
-        # 计算外观特征相似度矩阵 (dets x trks)
         if grid_off:
-            emb_cost = None if (trks_embs.shape[0] == 0 or det_embs.shape[0] == 0) else det_embs @ trks_embs.T
+            if det_embs is None or det_embs.size == 0:
+                emb_cost = None
+            else:
+                d_dim = det_embs.shape[1]
+                trk_list = []
+                for trk in trackers:
+                    e = np.asarray(trk.emb) if hasattr(trk, 'emb') else None
+                    if e is None:
+                        trk_list.append(np.zeros(d_dim, dtype=np.float32))
+                        continue
+                    if e.ndim == 2:
+                        e = e.mean(axis=0)
+                    if e.shape[0] != d_dim:
+                        m = min(d_dim, e.shape[0])
+                        v = np.zeros(d_dim, dtype=np.float32)
+                        v[:m] = e[:m]
+                        e = v
+                    trk_list.append(e)
+                trks_embs = np.vstack(trk_list) if len(trk_list) > 0 else np.zeros((0, d_dim), dtype=np.float32)
+                emb_cost = None if (trks_embs.shape[0] == 0 or det_embs.shape[0] == 0) else det_embs @ trks_embs.T
         else:
+            trks_embs = np.asarray([trk_emb.emb.tolist() for trk_emb in trackers])
             emb_cost = split_cosine_dist(det_embs, trks_embs)
         w_assoc_emb = 0.75
         aw_param = 0.4
@@ -202,26 +251,38 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 A = app_matrix_det_trk
                 row_ratio = 0.0
                 col_ratio = 0.0
+                # 放宽门控：margin>=0.07, top1>=0.45
+                margin_thr = 0.07
+                top1_thr = 0.45
                 if A.shape[1] >= 2:
                     sr = np.sort(A, axis=1)
                     top1 = sr[:, -1]
                     top2 = sr[:, -2]
-                    row_ok = ((top1 - top2) >= 0.10) & (top1 >= 0.5)
+                    row_ok = ((top1 - top2) >= margin_thr) & (top1 >= top1_thr)
                     row_ratio = row_ok.mean() if row_ok.size > 0 else 0.0
                 B = A.T
                 if B.shape[1] >= 2:
                     sc = np.sort(B, axis=1)
                     t1 = sc[:, -1]
                     t2 = sc[:, -2]
-                    col_ok = ((t1 - t2) >= 0.10) & (t1 >= 0.5)
+                    col_ok = ((t1 - t2) >= margin_thr) & (t1 >= top1_thr)
                     col_ratio = col_ok.mean() if col_ok.size > 0 else 0.0
-                appearance_reliable = (row_ratio >= 0.3 and col_ratio >= 0.3) or (row_ratio >= 0.5 or col_ratio >= 0.5)
+                # 放宽比例阈值
+                appearance_reliable = (row_ratio >= 0.25 and col_ratio >= 0.25) or (row_ratio >= 0.40 or col_ratio >= 0.40)
+
+                # 计算基础外观权重（受 appearance_weight 控制，最大0.15）
+                base_app = appearance_weight if (appearance_weight is not None) else 0.10
+                if base_app > 0.15:
+                    base_app = 0.15
+                if base_app < 0.0:
+                    base_app = 0.0
+
                 if appearance_reliable:
-                    w_app = appearance_weight if (appearance_weight is not None) else 0.10
-                    if w_app > 0.15:
-                        w_app = 0.15
-                    if w_app < 0.0:
-                        w_app = 0.0
+                    w_app = base_app
+                else:
+                    # 保底权重：仅在用户未显式设为0且确有嵌入时给极小权重
+                    w_app_min = 0.05
+                    w_app = min(w_app_min, base_app)
             angle_cfg_for_call = angle_config
             if angle_config is not None:
                 try:
@@ -241,10 +302,77 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 'iou': w_iou,
                 'velocity': 0.0,
                 'appearance': w_app,
-                'angle': w_ang
+                'angle': w_ang  # base angle weight (will be scaled per-pair if enabled)
             }
             total_w = w_app + w_iou + w_ang
             print(f"[L1 Weights] w_app={w_app:.3f}, w_iou={w_iou:.3f}, w_ang={w_ang:.3f}, sum={total_w:.3f}")
+
+            # Gaussian adaptive angle weights (pairwise): scale angle weight per (track, det)
+            # Only applied when angle feature is enabled
+            angle_weight_matrix = None
+            if enable_angle:
+                # Build angle arrays for trackers/detections
+                def _angle_from_track(trk):
+                    try:
+                        if hasattr(trk, 'pose') and trk.pose is not None and len(trk.pose) >= 7:
+                            return float(trk.pose[6])
+                        if hasattr(trk, 'angle'):
+                            return float(trk.angle)
+                        if hasattr(trk, 'bbox') and trk.bbox is not None:
+                            if len(trk.bbox) >= 7:
+                                return float(trk.bbox[6])
+                            if len(trk.bbox) >= 5:
+                                return float(trk.bbox[4])
+                    except Exception:
+                        pass
+                    return 0.0
+
+                def _angle_from_det(det):
+                    try:
+                        if hasattr(det, 'bbox') and det.bbox is not None:
+                            if len(det.bbox) >= 7:
+                                return float(det.bbox[6])
+                            if len(det.bbox) >= 5:
+                                return float(det.bbox[4])
+                        if hasattr(det, 'angle'):
+                            return float(det.angle)
+                        if isinstance(det, (list, tuple, np.ndarray)):
+                            if len(det) >= 7:
+                                return float(det[6])
+                            if len(det) >= 5:
+                                return float(det[4])
+                    except Exception:
+                        pass
+                    return 0.0
+
+                track_angles = np.array([_angle_from_track(t) for t in trackers], dtype=np.float32)
+                det_angles = np.array([_angle_from_det(d) for d in detections], dtype=np.float32)
+
+                if track_angles.size > 0 and det_angles.size > 0:
+                    # Use gaussian method to produce unit angle weights in [0,1]
+                    base_w = {'iou': 0.0, 'velocity': 0.0, 'appearance': 0.0, 'angle': 1.0}
+                    adaptive_w = compute_adaptive_cost_matrix_weights(
+                        track_angles, det_angles,
+                        base_weights=base_w,
+                        angle_weight_method='gaussian',
+                        verbose=False
+                    )
+                    # Scale by base scalar w_ang to get final per-pair angle weights
+                    angle_weight_matrix = w_ang * adaptive_w['angle']  # shape: (trks, dets)
+
+                    # Log actual angle weight statistics (pre-scaling and effective normalized)
+                    try:
+                        pre_mean = float(np.mean(angle_weight_matrix))
+                        pre_min = float(np.min(angle_weight_matrix))
+                        pre_max = float(np.max(angle_weight_matrix))
+                        denom = w_iou + w_app + angle_weight_matrix + 1e-12
+                        eff = angle_weight_matrix / denom
+                        eff_mean = float(np.mean(eff))
+                        eff_min = float(np.min(eff))
+                        eff_max = float(np.max(eff))
+                        print(f"[L1 AngleWeight] base={w_ang:.3f}, pre(mean/min/max)={pre_mean:.3f}/{pre_min:.3f}/{pre_max:.3f}, eff(mean/min/max)={eff_mean:.3f}/{eff_min:.3f}/{eff_max:.3f}")
+                    except Exception:
+                        pass
 
             fused_cost, angle_cost, gate_mask = compute_fused_cost_matrix(
                 trackers,
@@ -253,7 +381,13 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 velocity_matrix=None,
                 appearance_matrix=(app_matrix_det_trk.T if (not det_app and app_matrix_det_trk is not None) else None),
                 angle_config=(angle_cfg_for_call if enable_angle else None),
-                weights=weights,
+                weights={
+                    'iou': w_iou,
+                    'velocity': 0.0,
+                    'appearance': w_app,
+                    # If per-pair weights exist, pass matrix; otherwise fall back to scalar
+                    'angle': (angle_weight_matrix if (angle_weight_matrix is not None) else w_ang)
+                },
                 verbose=False
             )
 

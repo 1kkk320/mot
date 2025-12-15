@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import time
 from tracking import kalman_filter_2d
 from tracking.cost_function import (iou_batch, get_velocity, compute_velocity_similarity, 
                                      estimate_detection_velocity, compute_velocity_trend_similarity,
@@ -80,6 +81,11 @@ class Tracker:
         self.angle_config.angle_weight = self.angle_level1_weight
         self.angle_config.verbose = False
         self.backtrack_angle_gate_verbose = True
+        self.t_L1 = 0.0
+        self.t_L15 = 0.0
+        self.t_L2 = 0.0
+        self.t_L3 = 0.0
+        self.t_L4 = 0.0
 
     def predict_3d(self):
         # print(self.tracks_3d)
@@ -95,12 +101,15 @@ class Tracker:
 
     def update(self, detection_3D_fusion, detection_3D_only, detection_3Dto2D_only, detection_2D_only, calib_file, img, detection_2D_only_conf, detection_3D_fusion_conf, iou_threshold):
 
-        dets_3D_fusion_embs = np.ones((len(detection_3D_fusion),1))
-        dets_3D_only_embs = np.ones((len(detection_3D_only),1))
-        dets_2D_only_embs = np.ones((len(detection_2D_only),1))
+        # 恢复：初始化占位嵌入，随后在未关闭embedding时再计算真实特征
+        dets_3D_fusion_embs = np.ones((len(detection_3D_fusion), 1))
+        dets_3D_only_embs = np.ones((len(detection_3D_only), 1))
+        dets_2D_only_embs = np.ones((len(detection_2D_only), 1))
+
         det_3D_fusion_bboxs = [det_3d_f.additional_info[2:6] for det_3d_f in detection_3D_fusion]
         dets_fusion_alpha = None
         dets_2d_only_alpha = None
+        # 恢复：一级使用外观（若未关闭embedding）
         use_app_L1 = True
         if use_app_L1 and not self.embedding_off and len(detection_3D_fusion) > 0:
             dets_3D_fusion_embs = self.embedder.compute_embedding(img, det_3D_fusion_bboxs)
@@ -122,6 +131,7 @@ class Tracker:
         self.current_frame += 1
 
         # 1st Level of Association
+        t0 = time.time()
         matched_fusion_idx, unmatched_dets_fusion_idx, unmatched_trks_fusion_idx = associate_detections_to_trackers_fusion(
             detection_3D_fusion, self.tracks_3d, self.aw_off, self.grid_off, self.mot_off, iou_threshold,
             det_embs=dets_3D_fusion_embs, det_app=False, angle_config=self.angle_config,
@@ -135,12 +145,13 @@ class Tracker:
                     self.tracks_3d[track_idx].update_emb(dets_3D_fusion_embs[detection_idx], alpha=self.alpha_fixed_emb)
             self.tracks_3d[track_idx].state = 2
             self.tracks_3d[track_idx].fusion_time_update = 0
+        self.t_L1 += time.time() - t0
         # ========== Level 1.5: 速度自适应回溯关联 ==========
         # 在处理未匹配之前,先尝试速度回溯
         if self.velocity_backtrack_enabled and \
            len(unmatched_dets_fusion_idx) > 0 and \
            len(unmatched_trks_fusion_idx) > 0:
-            
+            t1 = time.time()
             print(f"[速度回溯] 未匹配检测: {len(unmatched_dets_fusion_idx)}, "
                   f"未匹配轨迹: {len(unmatched_trks_fusion_idx)}")
             
@@ -184,6 +195,7 @@ class Tracker:
             
             if len(velocity_matched) > 0:
                 print(f"[速度回溯] 📊 本帧匹配成功: {len(velocity_matched)}对")
+            self.t_L15 += time.time() - t1
                         
         # ========== 多帧关联 (Level 2.5) ==========
         # 在速度回溯关联后，对仍未匹配的轨迹进行多帧历史关联
@@ -239,12 +251,14 @@ class Tracker:
             self.tracks_3d[track_idx].fusion_time_update += 1
             self.tracks_3d[track_idx].mark_missed()
         for detection_idx in unmatched_dets_fusion_idx:
-            self._initiate_track_3d(detection_3D_fusion[detection_idx],dets_3D_fusion_embs[detection_idx])
+            self._initiate_track_3d(detection_3D_fusion[detection_idx], dets_3D_fusion_embs[detection_idx])
 
         #  2nd Level of Association
         self.unmatch_tracks_3d1 = [t for t in self.tracks_3d if t.time_since_update > 0]
+        t2 = time.time()
         matched_only_idx, unmatched_dets_only_idx, _ = associate_detections_to_trackers_fusion(
-            detection_3D_only, self.unmatch_tracks_3d1,self.aw_off,self.grid_off,self.mot_off, iou_threshold, det_embs=dets_3D_only_embs, det_app=self.app_off)
+            detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_threshold,
+            det_embs=dets_3D_only_embs, det_app=self.app_off)
         index_to_delete = []
         for detection_idx, track_idx in matched_only_idx:
             for index, t in enumerate(self.tracks_3d):
@@ -256,11 +270,13 @@ class Tracker:
                     break
         self.unmatch_tracks_3d1 = [self.unmatch_tracks_3d1[i] for i in range(len(self.unmatch_tracks_3d1)) if i not in index_to_delete]
         for detection_idx in unmatched_dets_only_idx:
-            self._initiate_track_3d(detection_3D_only[detection_idx],dets_3D_only_embs[detection_idx])
+            self._initiate_track_3d(detection_3D_only[detection_idx], dets_3D_only_embs[detection_idx])
         self.unmatch_tracks_3d2 = [t for t in self.tracks_3d if t.time_since_update == 0 and t.hits == 1 ]
         self.unmatch_tracks_3d = self.unmatch_tracks_3d1 + self.unmatch_tracks_3d2
+        self.t_L2 += time.time() - t2
 
         # 3rd Level of Association
+        t3 = time.time()
         matched, unmatch_trks, unmatch_dets = associate_detections_to_tracks(self.tracks_2d, detection_2D_only, iou_threshold, self.aw_off,self.grid_off,self.mot_off, det_embs=dets_2D_only_embs, det_app = self.app_off)
         for track_idx, detection_idx in matched:
             self.tracks_2d[track_idx].update_2d(self.kf_2d, detection_2D_only[detection_idx])
@@ -269,10 +285,12 @@ class Tracker:
         for track_idx in unmatch_trks:
             self.tracks_2d[track_idx].mark_missed()
         for detection_idx in unmatch_dets:
-            self._initiate_track_2d(detection_2D_only[detection_idx],dets_2D_only_embs[detection_idx])
+            self._initiate_track_2d(detection_2D_only[detection_idx], dets_2D_only_embs[detection_idx])
         self.tracks_2d = [t for t in self.tracks_2d if not t.is_deleted()]
+        self.t_L3 += time.time() - t3
 
         #  4th Level of Association
+        t4 = time.time()
         matched_track_2d, unmatch_tracks_2d = associate_2D_to_3D_tracking(self.tracks_2d, self.unmatch_tracks_3d, calib_file, iou_threshold)
         index_to_delete2 = []
         for track_idx_2d, track_idx_3d in matched_track_2d:
@@ -299,6 +317,7 @@ class Tracker:
             index_to_delete2.append(track_idx_2d)
         self.tracks_2d = [self.tracks_2d[i] for i in range(len(self.tracks_2d)) if i not in index_to_delete2]
         self.tracks_3d = [t for t in self.tracks_3d if not t.is_deleted()]
+        self.t_L4 += time.time() - t4
         
         # ========== DEBUG: 检查重复ID ==========
         track_ids = [t.track_id_3d for t in self.tracks_3d if t.is_confirmed()]

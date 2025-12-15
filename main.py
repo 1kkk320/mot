@@ -34,7 +34,7 @@ class DeepFusion(object):
         '''
         self.max_age = max_age
         self.min_hits = min_hits
-        self.tracker = Tracker(max_age, min_hits, app_off=True)
+        self.tracker = Tracker(max_age, min_hits, grid_off=True, app_off=True)
         self.reorder = [3, 4, 5, 6, 2, 1, 0]
         self.reorder_back = [6, 5, 4, 0, 1, 2, 3]
         self.frame_count = 0
@@ -118,8 +118,8 @@ class DeepFusion(object):
 def main():
     # Define the file name
     data_root = 'datasets/kitti/train'
-    detections_name_3D = '3D_virconv'  # CenterPoint 3D（LiDAR坐标）
-    detections_name_2D = '2D_rrc_Car'  # CenterPoint 2D（投影）
+    detections_name_3D = '3D_virconv'  
+    detections_name_2D = '2D_rrc_Car'  
 
     # Define the file path
     calib_root = os.path.join(data_root, 'calib')     #矫正数据
@@ -127,7 +127,7 @@ def main():
     detections_root_3D = os.path.join(data_root, detections_name_3D)
     detections_root_2D = os.path.join(data_root, detections_name_2D)
 
-    save_root = 'results/virconv_OCM'
+    save_root = r'E:\mot\results\virconv_OCM'
     txt_path_0 = os.path.join(save_root, 'data'); mkdir_if_inexistence(txt_path_0)
     image_path_0 = os.path.join(save_root, 'image'); mkdir_if_inexistence(image_path_0)
     enable_0002_override = os.environ.get('ENABLE_0002_OVERRIDE', '0').lower() in ('1', 'true', 'yes', 'on')
@@ -135,6 +135,9 @@ def main():
     # Optional overrides for grid search
     low_env = os.environ.get('ADAPTIVE_THRESHOLD_LOW')
     vmax_env = os.environ.get('VELOCITY_VMAX')
+    # Optional: sequence whitelist for VAL split (e.g., "0011,0012,...,0020")
+    seq_whitelist_env = os.environ.get('SEQ_WHITELIST', '').strip()
+    seq_whitelist = set([s.strip() for s in seq_whitelist_env.split(',') if s.strip()]) if seq_whitelist_env else None
     try:
         override_low = float(low_env) if low_env is not None else 0.565
     except ValueError:
@@ -149,17 +152,36 @@ def main():
     calib_files = os.listdir(calib_root) #返回指定的文件夹包含的文件或文件夹的名字的列表。
     detections_files_3D = os.listdir(detections_root_3D)
     detections_files_2D = os.listdir(detections_root_2D)
-    image_files = os.listdir(dataset_dir)
+    all_image_files = os.listdir(dataset_dir)
+    image_files = list(all_image_files)
+    # Filter by sequence whitelist if provided
+    if seq_whitelist:
+        image_files = [s for s in image_files if s in seq_whitelist]
     detection_file_list_3D, num_seq_3D = load_list_from_folder(detections_files_3D, detections_root_3D)
     detection_file_list_2D, num_seq_2D = load_list_from_folder(detections_files_2D, detections_root_2D)
     image_file_list, _ = load_list_from_folder(image_files, dataset_dir)
+    # Also filter detection lists by whitelist
+    if seq_whitelist:
+        detection_file_list_3D = [f for f in detection_file_list_3D if fileparts(f)[1] in seq_whitelist]
+        detection_file_list_2D = [f for f in detection_file_list_2D if fileparts(f)[1] in seq_whitelist]
 
-    # Pre-create empty result files for all sequences to avoid evaluator missing-file errors
-    for name in image_files:
-        open(os.path.join(txt_path_0, name + '.txt'), 'w').close()
+    # Pre-create empty result files for evaluator/consistency
+    # If running on train split, ensure 0000–0020 exist; on test, pre-create based on dataset listing
+    parts = set(os.path.normpath(data_root).split(os.sep))
+    if 'train' in parts or 'training' in parts:
+        all_train_seqs = [f"{i:04d}" for i in range(21)]
+        for name in all_train_seqs:
+            open(os.path.join(txt_path_0, name + '.txt'), 'w').close()
+    else:
+        for name in all_image_files:
+            open(os.path.join(txt_path_0, name + '.txt'), 'w').close()
 
     total_time, total_frames, i = 0.0, 0, 0  # Tracker runtime, total frames and Serial number of the dataset、跟踪器运行时，总时间、总帧数和数据集的序列号
     tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)  # 实验1B: 降低IoU阈值到0.22以进一步减少ID Switch
+    # Ablation Baseline: disable velocity backtrack and heading angle in Level 1
+    tracker.tracker.velocity_backtrack_enabled = True
+    tracker.tracker.enable_angle_in_level1 = True
+    tracker.tracker.angle_config.enable_angle_feature = True
     
 
     # Iterate through each data set 遍历数据集
@@ -253,6 +275,7 @@ def main():
             if total_image % 50 == 0:
                 print("Now start processing the {} image of the {} dataset".format(total_image, seq_id))
 
+            img_vis = img_0.copy()
             if len(trackers) > 0:
                 for d in trackers:
                     bbox3d = d.flatten()
@@ -270,7 +293,7 @@ def main():
                                 bbox2d_tmp_trk[1],bbox2d_tmp_trk[2],bbox2d_tmp_trk[3],bbox3d_tmp[0], bbox3d_tmp[1],bbox3d_tmp[2], bbox3d_tmp[3],
                                 bbox3d_tmp[4], bbox3d_tmp[5],bbox3d_tmp[6],conf_tmp)
                         f.write(str_to_srite)
-                        # show_image_with_boxes(img_0, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
+                        show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
             # if len(trackers_2d) > 0:
             #     for d in trackers_2d:
             #         bbox2d = d.flatten()
@@ -289,8 +312,27 @@ def main():
         i += 1
         print('--------------The time it takes to process all datasets are {}s --------------'.format(total_time))
     
+    # Per-level timing summary
+    t1 = tracker.tracker.t_L1
+    t15 = tracker.tracker.t_L15
+    t2 = tracker.tracker.t_L2
+    t3 = tracker.tracker.t_L3
+    t4 = tracker.tracker.t_L4
+    t_sum = t1 + t15 + t2 + t3 + t4
+    t_other = max(total_time - t_sum, 0.0)
+    def pct(x):
+        return 100.0 * x / total_time if total_time > 0 else 0.0
+    print('============== Per-Level Time ==============')
+    print('L1   (融合3D):      {:.3f}s ({:.2f}%)'.format(t1, pct(t1)))
+    print('L1.5 (速度回溯):    {:.3f}s ({:.2f}%)'.format(t15, pct(t15)))
+    print('L2   (仅3D):        {:.3f}s ({:.2f}%)'.format(t2, pct(t2)))
+    print('L3   (仅2D):        {:.3f}s ({:.2f}%)'.format(t3, pct(t3)))
+    print('L4   (2D→3D跨域):  {:.3f}s ({:.2f}%)'.format(t4, pct(t4)))
+    print('其他(数据装载/写盘等): {:.3f}s ({:.2f}%)'.format(t_other, pct(t_other)))
+    print('===========================================')
     print('--------------FPS = {} --------------'.format(total_frames/total_time))
 
 
 if __name__ == '__main__':
     main()
+
