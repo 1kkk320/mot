@@ -1,6 +1,7 @@
 import numpy as np
 import math
 import time
+import os
 from tracking import kalman_filter_2d
 from tracking.cost_function import (iou_batch, get_velocity, compute_velocity_similarity, 
                                      estimate_detection_velocity, compute_velocity_trend_similarity,
@@ -8,7 +9,7 @@ from tracking.cost_function import (iou_batch, get_velocity, compute_velocity_si
 from tracking.matching import associate_detections_to_trackers_fusion, associate_2D_to_3D_tracking, linear_assignment,associate_detections_to_tracks
 from tracking.track_2d import Track_2D
 from tracking.kalman_fileter_3d import  KalmanBoxTracker
-from tracking.track_3d import Track_3D
+from tracking.track_3d import Track_3D, TrackState
 from trackers.ocsort_embedding.embedding import EmbeddingComputer
 from tracking.matching import compute_aw_new_metric
 from tracking.angle_feature import AngleFeatureConfig, compute_angle_similarity_matrix
@@ -57,11 +58,12 @@ class Tracker:
         
         # ========== 多帧关联配置 ==========
         self.multi_frame_config = MultiFrameBacktrackConfig()
-        self.multi_frame_config.enable_multi_frame_backtrack = False  # ❌ 禁用多帧关联
+        self.multi_frame_config.enable_multi_frame_backtrack = True  # ✅ 启用多帧回溯（L2.5）
         self.multi_frame_config.min_backtrack_age = 3
         self.multi_frame_config.max_backtrack_age = 15
         self.multi_frame_config.lambda_decay = 0.05
         self.multi_frame_config.cost_threshold = -0.3
+        self.multi_frame_config.last_k_frames = 5
         self.multi_frame_config.verbose = False
         self.enable_angle_in_level1 = True       # 启用角度特征（创新开启）
         self.enable_angle_gate_in_backtrack = False
@@ -86,6 +88,11 @@ class Tracker:
         self.t_L2 = 0.0
         self.t_L3 = 0.0
         self.t_L4 = 0.0
+
+        # ===== 全局开关：多帧回溯（L2.5） =====
+        # 可通过环境变量 ENABLE_MULTI_FRAME_BACKTRACK 控制（'1','true','yes','on' 为启用）
+        env_flag = os.environ.get('ENABLE_MULTI_FRAME_BACKTRACK', '1').lower()
+        self.enable_backtrack_global = env_flag in ('1', 'true', 'yes', 'on')
 
     def predict_3d(self):
         # print(self.tracks_3d)
@@ -196,62 +203,11 @@ class Tracker:
             if len(velocity_matched) > 0:
                 print(f"[速度回溯] 📊 本帧匹配成功: {len(velocity_matched)}对")
             self.t_L15 += time.time() - t1
-                        
-        # ========== 多帧关联 (Level 2.5) ==========
-        # 在速度回溯关联后，对仍未匹配的轨迹进行多帧历史关联
-        if self.multi_frame_config.enable_multi_frame_backtrack and \
-           len(unmatched_dets_fusion_idx) > 0 and \
-           len(unmatched_trks_fusion_idx) > 0:
-            
-            print(f"[多帧关联] 尝试多帧回溯: 未匹配检测{len(unmatched_dets_fusion_idx)}, "
-                  f"未匹配轨迹{len(unmatched_trks_fusion_idx)}")
-            
-            # 提取未匹配的检测和轨迹
-            unmatched_dets_mf = [detection_3D_fusion[i] for i in unmatched_dets_fusion_idx]
-            unmatched_trks_mf = [self.tracks_3d[i] for i in unmatched_trks_fusion_idx]
-            
-            # 执行多帧回溯关联
-            multi_frame_matches = multi_frame_backtrack_association(
-                unmatched_trks_mf,
-                self.detection_history,
-                self.current_frame,
-                self.multi_frame_config
-            )
-            
-            # 处理多帧匹配结果
-            if len(multi_frame_matches) > 0:
-                updated_tracks = process_multi_frame_matches(
-                    multi_frame_matches,
-                    verbose=self.multi_frame_config.verbose
-                )
-                
-                # 更新嵌入特征
-                for track in updated_tracks:
-                    if not self.app_off:
-                        # 查找对应的检测嵌入
-                        for i, det in enumerate(detection_3D_fusion):
-                            if np.allclose(det.bbox[:3], track.pose[:3], atol=0.1):
-                                track.update_emb(dets_3D_fusion_embs[i])
-                                break
-                    
-                    # 从未匹配列表中移除已匹配的轨迹
-                    # 在self.tracks_3d中找到该轨迹的索引
-                    for idx, t in enumerate(self.tracks_3d):
-                        if t.track_id_3d == track.track_id_3d:
-                            if idx in unmatched_trks_fusion_idx:
-                                unmatched_trks_fusion_idx.remove(idx)
-                            break
-                
-                print(f"[多帧关联] ✅ 成功匹配: {len(multi_frame_matches)}对")
-            else:
-                print(f"[多帧关联] ❌ 未找到匹配")  
         
-        # 处理最终未匹配的轨迹和检测
+        # 处理最终未匹配的轨迹
         for track_idx in unmatched_trks_fusion_idx:
             self.tracks_3d[track_idx].fusion_time_update += 1
             self.tracks_3d[track_idx].mark_missed()
-        for detection_idx in unmatched_dets_fusion_idx:
-            self._initiate_track_3d(detection_3D_fusion[detection_idx], dets_3D_fusion_embs[detection_idx])
 
         #  2nd Level of Association
         self.unmatch_tracks_3d1 = [t for t in self.tracks_3d if t.time_since_update > 0]
@@ -271,6 +227,77 @@ class Tracker:
         self.unmatch_tracks_3d1 = [self.unmatch_tracks_3d1[i] for i in range(len(self.unmatch_tracks_3d1)) if i not in index_to_delete]
         for detection_idx in unmatched_dets_only_idx:
             self._initiate_track_3d(detection_3D_only[detection_idx], dets_3D_only_embs[detection_idx])
+
+        # ========== 多帧关联 (Level 2.5) - 移至L2之后 ==========
+        # 在L2（仅3D）之后，对仍未匹配的轨迹进行多帧历史关联
+        if self.enable_backtrack_global and \
+           self.multi_frame_config.enable_multi_frame_backtrack and \
+           len(self.unmatch_tracks_3d1) > 0:
+            print(f"[多帧关联] 尝试多帧回溯(L2后): 未匹配轨迹{len(self.unmatch_tracks_3d1)}")
+
+            unmatched_trks_mf = list(self.unmatch_tracks_3d1)
+            multi_frame_matches = multi_frame_backtrack_association(
+                unmatched_trks_mf,
+                self.detection_history,
+                self.current_frame,
+                self.multi_frame_config
+            )
+
+            if len(multi_frame_matches) > 0:
+                updated_tracks = process_multi_frame_matches(
+                    multi_frame_matches,
+                    verbose=self.multi_frame_config.verbose
+                )
+
+                # 从未匹配列表中移除已匹配的轨迹（按ID）
+                recovered_ids = set(t.track_id_3d for t in updated_tracks)
+                self.unmatch_tracks_3d1 = [t for t in self.unmatch_tracks_3d1 if t.track_id_3d not in recovered_ids]
+
+                # 可选：更新外观（基于当前帧融合3D检测近邻）
+                if not self.app_off and len(updated_tracks) > 0:
+                    for trk in updated_tracks:
+                        for i, det in enumerate(detection_3D_fusion):
+                            if np.allclose(det.bbox[:3], trk.pose[:3], atol=0.1):
+                                trk.update_emb(dets_3D_fusion_embs[i])
+                                break
+
+                print(f"[多帧回溯] 📊 本帧匹配成功: {len(multi_frame_matches)}对")
+            else:
+                print(f"[多帧关联] ❌ 未找到匹配")
+        # 在L2.5之后再对未匹配的融合3D检测新建轨迹
+        if len(unmatched_dets_fusion_idx) > 0:
+            for detection_idx in unmatched_dets_fusion_idx:
+                self._initiate_track_3d(detection_3D_fusion[detection_idx], dets_3D_fusion_embs[detection_idx])
+
+        # 冲突轨迹清理（基于中心距离）
+        def _cleanup_track_conflicts(pos_thresh=1.0):
+            active = [t for t in self.tracks_3d if not t.is_deleted()]
+            for i in range(len(active)):
+                for j in range(i + 1, len(active)):
+                    ti = active[i]
+                    tj = active[j]
+                    try:
+                        d = float(np.linalg.norm(ti.pose[:3] - tj.pose[:3]))
+                    except Exception:
+                        continue
+                    if d <= pos_thresh:
+                        ai = ti.is_confirmed()
+                        aj = tj.is_confirmed()
+                        if ai and not aj:
+                            loser = tj
+                        elif aj and not ai:
+                            loser = ti
+                        else:
+                            if ti.hits != tj.hits:
+                                loser = ti if ti.hits < tj.hits else tj
+                            elif ti.age != tj.age:
+                                loser = ti if ti.age < tj.age else tj
+                            else:
+                                loser = ti if ti.track_id_3d > tj.track_id_3d else tj
+                        loser.state = TrackState.Deleted
+
+        _cleanup_track_conflicts(pos_thresh=1.0)
+
         self.unmatch_tracks_3d2 = [t for t in self.tracks_3d if t.time_since_update == 0 and t.hits == 1 ]
         self.unmatch_tracks_3d = self.unmatch_tracks_3d1 + self.unmatch_tracks_3d2
         self.t_L2 += time.time() - t2
@@ -330,6 +357,19 @@ class Tracker:
         # ========================================
         
         # 更新检测历史 (帧计数已在函数开始时更新)
+        # 将当前帧融合3D检测的外观特征注入历史，便于回溯阶段使用外观相似度
+        try:
+            if (
+                isinstance(detection_3D_fusion, (list, tuple))
+                and len(detection_3D_fusion) == dets_3D_fusion_embs.shape[0]
+            ):
+                for i, det in enumerate(detection_3D_fusion):
+                    try:
+                        setattr(det, 'feature', dets_3D_fusion_embs[i])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self._update_detection_history(detection_3D_fusion)
 
     def _velocity_backtrack_association(self, detections, tracks, det_embs, det_indices):

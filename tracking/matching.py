@@ -305,7 +305,6 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 'angle': w_ang  # base angle weight (will be scaled per-pair if enabled)
             }
             total_w = w_app + w_iou + w_ang
-            print(f"[L1 Weights] w_app={w_app:.3f}, w_iou={w_iou:.3f}, w_ang={w_ang:.3f}, sum={total_w:.3f}")
 
             # Gaussian adaptive angle weights (pairwise): scale angle weight per (track, det)
             # Only applied when angle feature is enabled
@@ -360,19 +359,6 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                     # Scale by base scalar w_ang to get final per-pair angle weights
                     angle_weight_matrix = w_ang * adaptive_w['angle']  # shape: (trks, dets)
 
-                    # Log actual angle weight statistics (pre-scaling and effective normalized)
-                    try:
-                        pre_mean = float(np.mean(angle_weight_matrix))
-                        pre_min = float(np.min(angle_weight_matrix))
-                        pre_max = float(np.max(angle_weight_matrix))
-                        denom = w_iou + w_app + angle_weight_matrix + 1e-12
-                        eff = angle_weight_matrix / denom
-                        eff_mean = float(np.mean(eff))
-                        eff_min = float(np.min(eff))
-                        eff_max = float(np.max(eff))
-                        print(f"[L1 AngleWeight] base={w_ang:.3f}, pre(mean/min/max)={pre_mean:.3f}/{pre_min:.3f}/{pre_max:.3f}, eff(mean/min/max)={eff_mean:.3f}/{eff_min:.3f}/{eff_max:.3f}")
-                    except Exception:
-                        pass
 
             fused_cost, angle_cost, gate_mask = compute_fused_cost_matrix(
                 trackers,

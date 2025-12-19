@@ -126,7 +126,6 @@ def main():
     dataset_dir = os.path.join(data_root,'image_02')
     detections_root_3D = os.path.join(data_root, detections_name_3D)
     detections_root_2D = os.path.join(data_root, detections_name_2D)
-
     save_root = r'E:\mot\results\virconv_OCM'
     txt_path_0 = os.path.join(save_root, 'data'); mkdir_if_inexistence(txt_path_0)
     image_path_0 = os.path.join(save_root, 'image'); mkdir_if_inexistence(image_path_0)
@@ -135,9 +134,6 @@ def main():
     # Optional overrides for grid search
     low_env = os.environ.get('ADAPTIVE_THRESHOLD_LOW')
     vmax_env = os.environ.get('VELOCITY_VMAX')
-    # Optional: sequence whitelist for VAL split (e.g., "0011,0012,...,0020")
-    seq_whitelist_env = os.environ.get('SEQ_WHITELIST', '').strip()
-    seq_whitelist = set([s.strip() for s in seq_whitelist_env.split(',') if s.strip()]) if seq_whitelist_env else None
     try:
         override_low = float(low_env) if low_env is not None else 0.565
     except ValueError:
@@ -154,19 +150,11 @@ def main():
     detections_files_2D = os.listdir(detections_root_2D)
     all_image_files = os.listdir(dataset_dir)
     image_files = list(all_image_files)
-    # Filter by sequence whitelist if provided
-    if seq_whitelist:
-        image_files = [s for s in image_files if s in seq_whitelist]
     detection_file_list_3D, num_seq_3D = load_list_from_folder(detections_files_3D, detections_root_3D)
     detection_file_list_2D, num_seq_2D = load_list_from_folder(detections_files_2D, detections_root_2D)
     image_file_list, _ = load_list_from_folder(image_files, dataset_dir)
-    # Also filter detection lists by whitelist
-    if seq_whitelist:
-        detection_file_list_3D = [f for f in detection_file_list_3D if fileparts(f)[1] in seq_whitelist]
-        detection_file_list_2D = [f for f in detection_file_list_2D if fileparts(f)[1] in seq_whitelist]
 
     # Pre-create empty result files for evaluator/consistency
-    # If running on train split, ensure 0000–0020 exist; on test, pre-create based on dataset listing
     parts = set(os.path.normpath(data_root).split(os.sep))
     if 'train' in parts or 'training' in parts:
         all_train_seqs = [f"{i:04d}" for i in range(21)]

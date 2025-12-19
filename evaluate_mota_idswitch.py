@@ -24,7 +24,7 @@ if __name__ == "__main__":
     # 数据集配置
     dataset_config = trackeval.datasets.Kitti2DBox.get_default_dataset_config()
     dataset_config['GT_FOLDER'] = r'e:\mot\datasets\kitti\train'
-    dataset_config['TRACKERS_FOLDER'] = r'e:\mot\results_val'
+    dataset_config['TRACKERS_FOLDER'] = r'e:\mot\results'
     dataset_config['TRACKERS_TO_EVAL'] = ['virconv_OCM']
     dataset_config['CLASSES_TO_EVAL'] = ['car']  # 只评估car,因为没有检测到pedestrian
     dataset_config['SPLIT_TO_EVAL'] = 'training'
@@ -46,6 +46,7 @@ if __name__ == "__main__":
     # 创建评估器
     evaluator = trackeval.Evaluator(eval_config)
     dataset_list = [trackeval.datasets.Kitti2DBox(dataset_config)]
+    # 可选：通过环境变量 SEQ_WHITELIST 控制评估序列（与原逻辑保持一致）
     seq_env = os.environ.get('SEQ_WHITELIST', '').strip()
     if seq_env:
         seqs = [s.strip() for s in seq_env.split(',') if s.strip()]
