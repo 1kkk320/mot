@@ -166,10 +166,16 @@ def main():
 
     total_time, total_frames, i = 0.0, 0, 0  # Tracker runtime, total frames and Serial number of the dataset、跟踪器运行时，总时间、总帧数和数据集的序列号
     tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)  # 实验1B: 降低IoU阈值到0.22以进一步减少ID Switch
-    # Ablation Baseline: disable velocity backtrack and heading angle in Level 1
+    # 关闭 L1.5 速度回溯（干净基线）
     tracker.tracker.velocity_backtrack_enabled = True
+    # 恢复外观特征提取（embedding_off=False）
+    tracker.tracker.embedding_off = False
     tracker.tracker.enable_angle_in_level1 = True
     tracker.tracker.angle_config.enable_angle_feature = True
+    # 启用角度融合调试输出（将在融合阶段打印 angle 的权重与代价范围）
+    tracker.tracker.angle_config.verbose = True
+    # 开启 L2.5 多帧历史回溯
+    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True
     
 
     # Iterate through each data set 遍历数据集
@@ -277,23 +283,33 @@ def main():
                     label = f'{id_tmp} {type_tmp}'
                     image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
                     with open(txt_path, 'a') as f:
-                        str_to_srite = '%d %d %s 0 0 %f %f %f %f %f %f %f %f %f %f %f %f %f\n' % (frame, id_tmp,type_tmp, ori_tmp,bbox2d_tmp_trk[0],
-                                bbox2d_tmp_trk[1],bbox2d_tmp_trk[2],bbox2d_tmp_trk[3],bbox3d_tmp[0], bbox3d_tmp[1],bbox3d_tmp[2], bbox3d_tmp[3],
-                                bbox3d_tmp[4], bbox3d_tmp[5],bbox3d_tmp[6],conf_tmp)
+                        str_to_srite = (
+                            f"{frame:d} {id_tmp:d} {type_tmp} 0 0 "
+                            f"{ori_tmp:.6f} "
+                            f"{bbox2d_tmp_trk[0]:.6f} {bbox2d_tmp_trk[1]:.6f} {bbox2d_tmp_trk[2]:.6f} {bbox2d_tmp_trk[3]:.6f} "
+                            f"{bbox3d_tmp[0]:.6f} {bbox3d_tmp[1]:.6f} {bbox3d_tmp[2]:.6f} {bbox3d_tmp[3]:.6f} "
+                            f"{bbox3d_tmp[4]:.6f} {bbox3d_tmp[5]:.6f} {bbox3d_tmp[6]:.6f} "
+                            f"{conf_tmp:.6f}\n"
+                        )
                         f.write(str_to_srite)
-                        show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
-            # if len(trackers_2d) > 0:
-            #     for d in trackers_2d:
-            #         bbox2d = d.flatten()
-            #         # print(bbox2d,type(bbox2d))
-            #         bbox2d_tmp = bbox2d[1:5]
-            #         id_tmp = int(bbox2d[0])
-            #         color = compute_color_for_id(id_tmp)
-            #         image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
-            #         label = f'{id_tmp} {"car"}'
-            #         with open(txt_path, 'a') as f:
-            #             str_to_srite = '%d %d %s -1 -1 -10 %f %f %f %f -1000 -1000 -1000 -10 -1 -1 -1 -1\n' % (frame, id_tmp,bbox2d_tmp[0],bbox2d_tmp[1],bbox2d_tmp[2],bbox2d_tmp[3])
-            #             f.write(str_to_srite)
+                        #show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
+            if len(trackers_2d) > 0:
+                for d in trackers_2d:
+                    bbox2d = d.flatten()
+                    # print(bbox2d,type(bbox2d))
+                    bbox2d_tmp = bbox2d[1:5]
+                    id_tmp = int(bbox2d[0])
+                    color = compute_color_for_id(id_tmp)
+                    image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
+                    label = f'{id_tmp} {"car"}'
+                    with open(txt_path, 'a') as f:
+                        type_tmp = 'car'
+                        str_to_srite = (
+                            f"{frame:d} {id_tmp:d} {type_tmp} -1 -1 -10 "
+                            f"{bbox2d_tmp[0]:.6f} {bbox2d_tmp[1]:.6f} {bbox2d_tmp[2]:.6f} {bbox2d_tmp[3]:.6f} "
+                            f"-1000 -1000 -1000 -10 -1 -1 -1 -1\n"
+                        )
+                        f.write(str_to_srite)
                         # plot_one_box(bbox2d,img_0,image_path,color,img0_name,label,line_thickness=1)
                         # print(image_save_path)
 

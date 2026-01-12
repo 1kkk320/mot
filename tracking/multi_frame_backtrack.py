@@ -4,7 +4,7 @@
 """
 
 import numpy as np
-from tracking.cost_function import get_velocity, compute_adaptive_weight_linear
+from tracking.cost_function import get_velocity, compute_adaptive_weight_linear, estimate_detection_velocity, compute_velocity_similarity as compute_velocity_similarity_vec
 from tracking.matching import linear_assignment
 
 
@@ -16,14 +16,14 @@ class MultiFrameBacktrackConfig:
         self.enable_multi_frame_backtrack = True
         
         # 触发条件
-        self.min_backtrack_age = 3              # 最少缺失3帧
+        self.min_backtrack_age = 4              # 最少缺失3帧
         self.max_backtrack_age = 15             # 最多缺失15帧
         
         # 衰减系数
-        self.lambda_decay = 0.1                 # 衰减系数 (0.05-0.2)
+        self.lambda_decay = 0.12                # 衰减系数 (0.05-0.2)
         
         # 代价阈值
-        self.cost_threshold = -0.5              # 代价阈值 (-1.0 ~ 0)
+        self.cost_threshold = -0.55             # 代价阈值 (-1.0 ~ 0)
         
         # 检测缓冲
         self.detection_buffer_size = 30         # 保留30帧检测
@@ -32,14 +32,15 @@ class MultiFrameBacktrackConfig:
         self.iou_weight = 0.5
         self.velocity_weight = 0.3
         self.appearance_weight = 0.2
+        self.appearance_hard_gate = 0.6
         
         # 调试
         self.verbose = False
         # 最近帧窗口与候选控制
         self.last_k_frames = 5
-        self.topk_per_frame = 2
+        self.topk_per_frame = 1
         # 速度自适应参数
-        self.vmax_for_adaptive_weight = 10.0
+        self.vmax_for_adaptive_weight = 12.0
         # 协方差不确定性归一化尺度（m）
         self.uncertainty_norm = 3.0
         # 使用全局最优（线性分配）代替贪心
@@ -222,8 +223,12 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
             iou = compute_iou_3d(rollback_pose, det.bbox)
             if iou <= 1e-6:
                 continue
-            vel_sim = compute_velocity_similarity(track, det)
             app_sim = compute_appearance_similarity(track, det)
+            if app_sim < getattr(config, 'appearance_hard_gate', 0.6):
+                continue
+            det_vel = estimate_detection_velocity(det, detection_buffer, fid)
+            trk_vel = get_velocity(track)
+            vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
             # 外观上限：短遮挡/长遮挡
             cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
             base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
@@ -325,8 +330,12 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                 iou = compute_iou_3d(rollback_pose, det.bbox)
                 if iou <= 1e-6:
                     continue
-                vel_sim = compute_velocity_similarity(track, det)
                 app_sim = compute_appearance_similarity(track, det)
+                if app_sim < getattr(config, 'appearance_hard_gate', 0.6):
+                    continue
+                det_vel = estimate_detection_velocity(det, detection_buffer, fid)
+                trk_vel = get_velocity(track)
+                vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
                 # 外观权重（自适应上限）
                 cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
                 base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
@@ -453,7 +462,13 @@ def process_multi_frame_matches(matched_pairs, virtual_update_config=None,
             for _ in range(dt):
                 track.kf_3d.kf.predict()
             track.fusion_time_update += 1
+            track.last_backtrack_dt = dt
             track.last_decay_factor = decay
+            try:
+                if hasattr(track, 'reset_rassa'):
+                    track.reset_rassa()
+            except Exception:
+                pass
             updated_tracks.append(track)
             if verbose:
                 print(f"[多帧更新完成] 轨迹{track.track_id_3d}: Δt={dt}, 衰减因子={decay:.4f}")

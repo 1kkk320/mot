@@ -19,7 +19,7 @@ from tracking.multi_frame_backtrack import (MultiFrameBacktrackConfig,
 
 
 class Tracker:
-    def __init__(self, max_age, n_init, embeddiong_off=False, aw_off=False, grid_off=False,app_off=True,**kwargs):
+    def __init__(self, max_age, n_init, embeddiong_off=False, aw_off=False, grid_off=False,app_off=False,**kwargs):
         self.max_age = max_age
         self.n_init = n_init
         self.tracks_3d = []
@@ -31,7 +31,7 @@ class Tracker:
         self.embedding_off = embeddiong_off
         self.aw_off = aw_off
         self.det_thresh = 0.2
-        self.alpha_fixed_emb = 0.9
+        self.alpha_fixed_emb = 0.8
         self.grid_off = grid_off
         self.app_off = app_off
         self.mot_off = False
@@ -45,7 +45,7 @@ class Tracker:
         self.adaptive_weight = True              # 启用自适应速度权重 (方案B)
         self.detection_history = {}              # 历史检测缓存 {frame_id: detections}
         self.current_frame = 0                   # 当前帧计数
-        self.velocity_weight_vmax = 10.0
+        self.velocity_weight_vmax = 12.0
         self.adaptive_threshold_low = 0.55
         self.adaptive_threshold_mid = 0.60
         self.adaptive_threshold_high = 0.70
@@ -58,16 +58,20 @@ class Tracker:
         
         # ========== 多帧关联配置 ==========
         self.multi_frame_config = MultiFrameBacktrackConfig()
-        self.multi_frame_config.enable_multi_frame_backtrack = True  # ✅ 启用多帧回溯（L2.5）
-        self.multi_frame_config.min_backtrack_age = 3
+        self.multi_frame_config.vmax_for_adaptive_weight = 12.0
+        self.multi_frame_config.enable_multi_frame_backtrack = False  # ✅ 启用多帧回溯（L2.5）
+        self.multi_frame_config.min_backtrack_age = 4
         self.multi_frame_config.max_backtrack_age = 15
-        self.multi_frame_config.lambda_decay = 0.05
-        self.multi_frame_config.cost_threshold = -0.3
+        self.multi_frame_config.lambda_decay = 0.15
+        self.multi_frame_config.cost_threshold = -0.35
         self.multi_frame_config.last_k_frames = 5
+        self.multi_frame_config.topk_per_frame = 1
         self.multi_frame_config.verbose = False
-        self.enable_angle_in_level1 = True       # 启用角度特征（创新开启）
+        self.multi_frame_config.appearance_weight = 0.2
+        self.multi_frame_config.appearance_hard_gate = 0.55
+        self.enable_angle_in_level1 = True        # 启用角度特征（创新开启）
         self.enable_angle_gate_in_backtrack = False
-        self.angle_level1_weight = 0.25
+        self.angle_level1_weight = 0.35
         self.angle_level1_method = 'gaussian'
         self.angle_level1_sigma = 0.35
         self.angle_level1_gate_threshold = math.radians(45)
@@ -78,16 +82,30 @@ class Tracker:
         self.angle_config.enable_angle_feature = self.enable_angle_in_level1
         self.angle_config.angle_cost_method = self.angle_level1_method
         self.angle_config.angle_cost_sigma = self.angle_level1_sigma
-        self.angle_config.enable_angle_gate = True   # 启用角度门控（创新开启）
+        self.angle_config.enable_angle_gate = False   # 启用角度门控（创新开启）
         self.angle_config.angle_gate_threshold = self.angle_level1_gate_threshold
         self.angle_config.angle_weight = self.angle_level1_weight
         self.angle_config.verbose = False
         self.backtrack_angle_gate_verbose = True
-        self.t_L1 = 0.0
-        self.t_L15 = 0.0
-        self.t_L2 = 0.0
-        self.t_L3 = 0.0
-        self.t_L4 = 0.0
+        self.last_t_L1 = 0.0
+        self.last_t_L15 = 0.0
+        self.last_t_L2 = 0.0
+        self.last_t_L3 = 0.0
+        self.last_t_L4 = 0.0
+        self.last_t_L25 = 0.0
+        self._timing_eps = 1e-6
+        self.sum_t_L1 = 0.0
+        self.cnt_t_L1 = 0
+        self.sum_t_L15 = 0.0
+        self.cnt_t_L15 = 0
+        self.sum_t_L2 = 0.0
+        self.cnt_t_L2 = 0
+        self.sum_t_L25 = 0.0
+        self.cnt_t_L25 = 0
+        self.sum_t_L3 = 0.0
+        self.cnt_t_L3 = 0
+        self.sum_t_L4 = 0.0
+        self.cnt_t_L4 = 0
 
         # ===== 全局开关：多帧回溯（L2.5） =====
         # 可通过环境变量 ENABLE_MULTI_FRAME_BACKTRACK 控制（'1','true','yes','on' 为启用）
@@ -106,6 +124,85 @@ class Tracker:
             # print(track)
             track.predict_2d(self.kf_2d)
 
+    @property
+    def t_L1(self):
+        return self.last_t_L1
+
+    @property
+    def t_L15(self):
+        return self.last_t_L15
+
+    @property
+    def t_L2(self):
+        return self.last_t_L2
+
+    @property
+    def t_L3(self):
+        return self.last_t_L3
+
+    @property
+    def t_L4(self):
+        return self.last_t_L4
+
+    @property
+    def t_L25(self):
+        return self.last_t_L25
+
+    @property
+    def avg_t_L1(self):
+        return self.sum_t_L1 / self.cnt_t_L1 if self.cnt_t_L1 > 0 else 0.0
+
+    @property
+    def avg_t_L15(self):
+        return self.sum_t_L15 / self.cnt_t_L15 if self.cnt_t_L15 > 0 else 0.0
+
+    @property
+    def avg_t_L2(self):
+        return self.sum_t_L2 / self.cnt_t_L2 if self.cnt_t_L2 > 0 else 0.0
+
+    @property
+    def avg_t_L25(self):
+        return self.sum_t_L25 / self.cnt_t_L25 if self.cnt_t_L25 > 0 else 0.0
+
+    @property
+    def avg_t_L3(self):
+        return self.sum_t_L3 / self.cnt_t_L3 if self.cnt_t_L3 > 0 else 0.0
+
+    @property
+    def avg_t_L4(self):
+        return self.sum_t_L4 / self.cnt_t_L4 if self.cnt_t_L4 > 0 else 0.0
+
+    @property
+    def trig_cnt_L1(self):
+        return self.cnt_t_L1
+
+    @property
+    def trig_cnt_L15(self):
+        return self.cnt_t_L15
+
+    @property
+    def trig_cnt_L2(self):
+        return self.cnt_t_L2
+
+    @property
+    def trig_cnt_L25(self):
+        return self.cnt_t_L25
+
+    @property
+    def trig_cnt_L3(self):
+        return self.cnt_t_L3
+
+    @property
+    def trig_cnt_L4(self):
+        return self.cnt_t_L4
+
+    @property
+    def est_one_pass_avg(self):
+        return (
+            self.avg_t_L1 + self.avg_t_L15 + self.avg_t_L2 +
+            self.avg_t_L25 + self.avg_t_L3 + self.avg_t_L4
+        )
+
     def update(self, detection_3D_fusion, detection_3D_only, detection_3Dto2D_only, detection_2D_only, calib_file, img, detection_2D_only_conf, detection_3D_fusion_conf, iou_threshold):
 
         # 恢复：初始化占位嵌入，随后在未关闭embedding时再计算真实特征
@@ -120,6 +217,13 @@ class Tracker:
         use_app_L1 = True
         if use_app_L1 and not self.embedding_off and len(detection_3D_fusion) > 0:
             dets_3D_fusion_embs = self.embedder.compute_embedding(img, det_3D_fusion_bboxs)
+        # 二级/三级：为仅3D与仅2D检测计算外观特征（若未关闭embedding且允许使用外观）
+        if not self.embedding_off and not self.app_off and len(detection_3D_only) > 0:
+            det_3D_only_bboxs = [det_3d_o.additional_info[2:6] for det_3d_o in detection_3D_only]
+            dets_3D_only_embs = self.embedder.compute_embedding(img, det_3D_only_bboxs)
+        if not self.embedding_off and not self.app_off and len(detection_2D_only) > 0:
+            det_2D_only_bboxs = [det.to_x1y1x2y2() for det in detection_2D_only]
+            dets_2D_only_embs = self.embedder.compute_embedding(img, det_2D_only_bboxs)
         if len(detection_3D_fusion_conf) != 0:
             trust_fusion = np.asarray([(i - self.det_thresh) / (1 - self.det_thresh) for i in detection_3D_fusion_conf])
         else:
@@ -134,25 +238,59 @@ class Tracker:
         if len(trust_2D_only) != 0:
             dets_2d_only_alpha = af + (1 - af) * (1 - trust_2D_only)
 
+        try:
+            if len(detection_3D_fusion_conf) == len(detection_3D_fusion):
+                for i, det in enumerate(detection_3D_fusion):
+                    try:
+                        det.score = float(detection_3D_fusion_conf[i])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         # 更新帧计数 (在关联之前)
         self.current_frame += 1
+        self.last_t_L15 = 0.0
+        self.last_t_L25 = 0.0
+        print(f"[L1.5调试] 进入update: 帧={self.current_frame}, L1.5启用={self.velocity_backtrack_enabled}", flush=True)
 
         # 1st Level of Association
         t0 = time.time()
+        iou_shreshold=0.01
+        # 保持权重接线：每帧将配置中的角度权重更新为 Tracker.angle_level1_weight
+        try:
+            self.angle_config.angle_weight = float(self.angle_level1_weight)
+        except Exception:
+            pass
         matched_fusion_idx, unmatched_dets_fusion_idx, unmatched_trks_fusion_idx = associate_detections_to_trackers_fusion(
-            detection_3D_fusion, self.tracks_3d, self.aw_off, self.grid_off, self.mot_off, iou_threshold,
+            detection_3D_fusion, self.tracks_3d, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
             det_embs=dets_3D_fusion_embs, det_app=False, angle_config=self.angle_config,
             enable_angle=self.enable_angle_in_level1, appearance_weight=self.appearance_weight_level1)
+        print(f"[L1.5调试] L1未匹配统计: 检测={len(unmatched_dets_fusion_idx)}, 轨迹={len(unmatched_trks_fusion_idx)}", flush=True)
         for detection_idx, track_idx in matched_fusion_idx:
             self.tracks_3d[track_idx].update_3d(detection_3D_fusion[detection_idx])
             if use_app_L1 and dets_3D_fusion_embs.shape[0] > detection_idx:
-                if dets_fusion_alpha is not None and dets_fusion_alpha.shape[0] > detection_idx:
-                    self.tracks_3d[track_idx].update_emb(dets_3D_fusion_embs[detection_idx], alpha=dets_fusion_alpha[detection_idx])
+                # 软更新策略：低分数采用极小步长
+                alpha_use = None
+                try:
+                    sc = float(getattr(detection_3D_fusion[detection_idx], 'score', 1.0))
+                except Exception:
+                    sc = 1.0
+                if sc < 0.4:
+                    alpha_use = 0.99
                 else:
-                    self.tracks_3d[track_idx].update_emb(dets_3D_fusion_embs[detection_idx], alpha=self.alpha_fixed_emb)
+                    if dets_fusion_alpha is not None and dets_fusion_alpha.shape[0] > detection_idx:
+                        alpha_use = float(dets_fusion_alpha[detection_idx])
+                    else:
+                        alpha_use = self.alpha_fixed_emb
+                self.tracks_3d[track_idx].update_emb(dets_3D_fusion_embs[detection_idx], alpha=alpha_use)
+                try:
+                    detection_3D_fusion[detection_idx].feature = self.tracks_3d[track_idx].emb
+                except Exception:
+                    pass
             self.tracks_3d[track_idx].state = 2
             self.tracks_3d[track_idx].fusion_time_update = 0
-        self.t_L1 += time.time() - t0
+        self.last_t_L1 = time.time() - t0
         # ========== Level 1.5: 速度自适应回溯关联 ==========
         # 在处理未匹配之前,先尝试速度回溯
         if self.velocity_backtrack_enabled and \
@@ -160,7 +298,7 @@ class Tracker:
            len(unmatched_trks_fusion_idx) > 0:
             t1 = time.time()
             print(f"[速度回溯] 未匹配检测: {len(unmatched_dets_fusion_idx)}, "
-                  f"未匹配轨迹: {len(unmatched_trks_fusion_idx)}")
+                  f"未匹配轨迹: {len(unmatched_trks_fusion_idx)}", flush=True)
             
             # 提取未匹配的检测和轨迹
             unmatched_dets = [detection_3D_fusion[i] for i in unmatched_dets_fusion_idx]
@@ -184,13 +322,21 @@ class Tracker:
                     detection_3D_fusion[original_det_idx]
                 )
                 if not self.app_off:
-                    self.tracks_3d[original_trk_idx].update_emb(
-                        dets_3D_fusion_embs[original_det_idx]
-                    )
+                    # 软更新策略：低分数采用极小步长
+                    try:
+                        sc = float(getattr(detection_3D_fusion[original_det_idx], 'score', 1.0))
+                    except Exception:
+                        sc = 1.0
+                    alpha_use = 0.99 if sc < 0.4 else self.alpha_fixed_emb
+                    self.tracks_3d[original_trk_idx].update_emb(dets_3D_fusion_embs[original_det_idx], alpha=alpha_use)
+                    try:
+                        detection_3D_fusion[original_det_idx].feature = self.tracks_3d[original_trk_idx].emb
+                    except Exception:
+                        pass
                 self.tracks_3d[original_trk_idx].state = 2
                 self.tracks_3d[original_trk_idx].fusion_time_update = 0
                 
-                print(f"[速度回溯] ✅ 成功匹配: 检测{original_det_idx} ↔ 轨迹{original_trk_idx}")
+                print(f"[速度回溯] ✅ 成功匹配: 检测{original_det_idx} ↔ 轨迹{original_trk_idx}", flush=True)
             
             # 更新未匹配列表 (只保留真正未匹配的)
             unmatched_dets_fusion_idx = [
@@ -201,8 +347,11 @@ class Tracker:
             ]
             
             if len(velocity_matched) > 0:
-                print(f"[速度回溯] 📊 本帧匹配成功: {len(velocity_matched)}对")
-            self.t_L15 += time.time() - t1
+                print(f"[速度回溯] 📊 本帧匹配成功: {len(velocity_matched)}对", flush=True)
+            self.last_t_L15 = time.time() - t1
+        else:
+            if self.velocity_backtrack_enabled:
+                print(f"[速度回溯] 未触发: enable=True, 未匹配检测={len(unmatched_dets_fusion_idx)}, 未匹配轨迹={len(unmatched_trks_fusion_idx)}", flush=True)
         
         # 处理最终未匹配的轨迹
         for track_idx in unmatched_trks_fusion_idx:
@@ -212,21 +361,29 @@ class Tracker:
         #  2nd Level of Association
         self.unmatch_tracks_3d1 = [t for t in self.tracks_3d if t.time_since_update > 0]
         t2 = time.time()
+        iou_shreshold=0.01
         matched_only_idx, unmatched_dets_only_idx, _ = associate_detections_to_trackers_fusion(
-            detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_threshold,
-            det_embs=dets_3D_only_embs, det_app=self.app_off)
+            detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
+            det_embs=dets_3D_only_embs, det_app=self.app_off, appearance_weight=self.appearance_weight_level1)
         index_to_delete = []
         for detection_idx, track_idx in matched_only_idx:
             for index, t in enumerate(self.tracks_3d):
                 if t.track_id_3d == self.unmatch_tracks_3d1[track_idx].track_id_3d:
                     t.update_3d(detection_3D_only[detection_idx])
                     if not self.app_off:
-                        t.update_emb(dets_3D_only_embs[detection_idx])
+                        # 软更新策略：低分数采用极小步长（若无score则按固定alpha）
+                        try:
+                            sc = float(getattr(detection_3D_only[detection_idx], 'score', 1.0))
+                        except Exception:
+                            sc = 1.0
+                        alpha_use = 0.99 if sc < 0.4 else self.alpha_fixed_emb
+                        t.update_emb(dets_3D_only_embs[detection_idx], alpha=alpha_use)
                     index_to_delete.append(track_idx)
                     break
         self.unmatch_tracks_3d1 = [self.unmatch_tracks_3d1[i] for i in range(len(self.unmatch_tracks_3d1)) if i not in index_to_delete]
         for detection_idx in unmatched_dets_only_idx:
             self._initiate_track_3d(detection_3D_only[detection_idx], dets_3D_only_embs[detection_idx])
+        self.last_t_L2 = time.time() - t2
 
         # ========== 多帧关联 (Level 2.5) - 移至L2之后 ==========
         # 在L2（仅3D）之后，对仍未匹配的轨迹进行多帧历史关联
@@ -234,6 +391,7 @@ class Tracker:
            self.multi_frame_config.enable_multi_frame_backtrack and \
            len(self.unmatch_tracks_3d1) > 0:
             print(f"[多帧关联] 尝试多帧回溯(L2后): 未匹配轨迹{len(self.unmatch_tracks_3d1)}")
+            t25 = time.time()
 
             unmatched_trks_mf = list(self.unmatch_tracks_3d1)
             multi_frame_matches = multi_frame_backtrack_association(
@@ -249,6 +407,13 @@ class Tracker:
                     verbose=self.multi_frame_config.verbose
                 )
 
+                for trk in updated_tracks:
+                    dt_val = getattr(trk, 'last_backtrack_dt', None)
+                    if dt_val is not None:
+                        print(f"[L2.5 重置验证] 轨迹{trk.track_id_3d}: Δt={dt_val}, beta_t={getattr(trk, 'beta_t', float('nan')):.3f}", flush=True)
+                    else:
+                        print(f"[L2.5 重置验证] 轨迹{trk.track_id_3d}: Δt=NA, beta_t={getattr(trk, 'beta_t', float('nan')):.3f}", flush=True)
+
                 # 从未匹配列表中移除已匹配的轨迹（按ID）
                 recovered_ids = set(t.track_id_3d for t in updated_tracks)
                 self.unmatch_tracks_3d1 = [t for t in self.unmatch_tracks_3d1 if t.track_id_3d not in recovered_ids]
@@ -258,12 +423,19 @@ class Tracker:
                     for trk in updated_tracks:
                         for i, det in enumerate(detection_3D_fusion):
                             if np.allclose(det.bbox[:3], trk.pose[:3], atol=0.1):
-                                trk.update_emb(dets_3D_fusion_embs[i])
+                                # 软更新策略：低分数采用极小步长
+                                try:
+                                    sc = float(getattr(det, 'score', 1.0))
+                                except Exception:
+                                    sc = 1.0
+                                alpha_use = 0.99 if sc < 0.4 else self.alpha_fixed_emb
+                                trk.update_emb(dets_3D_fusion_embs[i], alpha=alpha_use)
                                 break
 
                 print(f"[多帧回溯] 📊 本帧匹配成功: {len(multi_frame_matches)}对")
             else:
                 print(f"[多帧关联] ❌ 未找到匹配")
+            self.last_t_L25 = time.time() - t25
         # 在L2.5之后再对未匹配的融合3D检测新建轨迹
         if len(unmatched_dets_fusion_idx) > 0:
             for detection_idx in unmatched_dets_fusion_idx:
@@ -300,11 +472,11 @@ class Tracker:
 
         self.unmatch_tracks_3d2 = [t for t in self.tracks_3d if t.time_since_update == 0 and t.hits == 1 ]
         self.unmatch_tracks_3d = self.unmatch_tracks_3d1 + self.unmatch_tracks_3d2
-        self.t_L2 += time.time() - t2
 
         # 3rd Level of Association
         t3 = time.time()
-        matched, unmatch_trks, unmatch_dets = associate_detections_to_tracks(self.tracks_2d, detection_2D_only, iou_threshold, self.aw_off,self.grid_off,self.mot_off, det_embs=dets_2D_only_embs, det_app = self.app_off)
+        iou_shreshold=0.4
+        matched, unmatch_trks, unmatch_dets = associate_detections_to_tracks(self.tracks_2d, detection_2D_only, iou_shreshold, self.aw_off,self.grid_off,self.mot_off, det_embs=dets_2D_only_embs, det_app = self.app_off)
         for track_idx, detection_idx in matched:
             self.tracks_2d[track_idx].update_2d(self.kf_2d, detection_2D_only[detection_idx])
             if not self.app_off:
@@ -314,7 +486,7 @@ class Tracker:
         for detection_idx in unmatch_dets:
             self._initiate_track_2d(detection_2D_only[detection_idx], dets_2D_only_embs[detection_idx])
         self.tracks_2d = [t for t in self.tracks_2d if not t.is_deleted()]
-        self.t_L3 += time.time() - t3
+        self.last_t_L3 = time.time() - t3
 
         #  4th Level of Association
         t4 = time.time()
@@ -344,7 +516,8 @@ class Tracker:
             index_to_delete2.append(track_idx_2d)
         self.tracks_2d = [self.tracks_2d[i] for i in range(len(self.tracks_2d)) if i not in index_to_delete2]
         self.tracks_3d = [t for t in self.tracks_3d if not t.is_deleted()]
-        self.t_L4 += time.time() - t4
+        self.last_t_L4 = time.time() - t4
+        self._accumulate_timing()
         
         # ========== DEBUG: 检查重复ID ==========
         track_ids = [t.track_id_3d for t in self.tracks_3d if t.is_confirmed()]
@@ -365,12 +538,14 @@ class Tracker:
             ):
                 for i, det in enumerate(detection_3D_fusion):
                     try:
-                        setattr(det, 'feature', dets_3D_fusion_embs[i])
+                        if getattr(det, 'feature', None) is None:
+                            det.feature = dets_3D_fusion_embs[i]
                     except Exception:
                         pass
         except Exception:
             pass
         self._update_detection_history(detection_3D_fusion)
+        self._debug_print_active_betas()
 
     def _velocity_backtrack_association(self, detections, tracks, det_embs, det_indices):
         """
@@ -480,8 +655,8 @@ class Tracker:
                 )
         
         if self.enable_angle_gate_in_backtrack:
-            track_angles = np.array([trk.pose[6] if len(trk.pose) >= 7 else 0.0 for trk in tracks])
-            det_angles = np.array([det.bbox[6] if len(det.bbox) >= 7 else 0.0 for det in detections])
+            track_angles = np.array([trk.pose[6] if (hasattr(trk, 'pose') and trk.pose is not None and len(trk.pose) >= 7) else 0.0 for trk in tracks])
+            det_angles = np.array([det.bbox[6] if (hasattr(det, 'bbox') and det.bbox is not None and len(det.bbox) >= 7) else 0.0 for det in detections])
             _, gate_mask = compute_angle_similarity_matrix(
                 track_angles,
                 det_angles,
@@ -562,6 +737,44 @@ class Tracker:
         if len(self.detection_history) > 5:
             oldest_frame = min(self.detection_history.keys())
             del self.detection_history[oldest_frame]
+
+    def reset_timing_stats(self):
+        self.sum_t_L1 = 0.0
+        self.cnt_t_L1 = 0
+        self.sum_t_L15 = 0.0
+        self.cnt_t_L15 = 0
+        self.sum_t_L2 = 0.0
+        self.cnt_t_L2 = 0
+        self.sum_t_L25 = 0.0
+        self.cnt_t_L25 = 0
+        self.sum_t_L3 = 0.0
+        self.cnt_t_L3 = 0
+        self.sum_t_L4 = 0.0
+        self.cnt_t_L4 = 0
+
+    def _accumulate_timing(self):
+        e = self._timing_eps
+        if self.last_t_L1 > e:
+            self.sum_t_L1 += self.last_t_L1
+            self.cnt_t_L1 += 1
+        if self.last_t_L15 > e:
+            self.sum_t_L15 += self.last_t_L15
+            self.cnt_t_L15 += 1
+        if self.last_t_L2 > e:
+            self.sum_t_L2 += self.last_t_L2
+            self.cnt_t_L2 += 1
+        if self.last_t_L25 > e:
+            self.sum_t_L25 += self.last_t_L25
+            self.cnt_t_L25 += 1
+        if self.last_t_L3 > e:
+            self.sum_t_L3 += self.last_t_L3
+            self.cnt_t_L3 += 1
+        if self.last_t_L4 > e:
+            self.sum_t_L4 += self.last_t_L4
+            self.cnt_t_L4 += 1
+
+    def _debug_print_active_betas(self):
+        return
 
     def _initiate_track_3d(self, detection,emb=None):
         self.kf_3d = KalmanBoxTracker(detection.bbox)

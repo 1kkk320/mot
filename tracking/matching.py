@@ -55,7 +55,6 @@ def linear_assignment(cost_matrix):
 
 
 def associate_detections_to_tracks(tracks, detections, threshold, aw_off, grid_off,mot_off, det_embs=None, det_app = False):
-    threshold = 0.3
     track_indices = list(range(len(tracks)))
     detection_indices = list(range(len(detections)))
     if len(track_indices) == 0 or len(detection_indices) == 0:
@@ -184,21 +183,50 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
     trks_confidece = [trk.confidence for trk in trackers]
     if len(trks_8corner) > 0:
         trks_8corner = np.stack(trks_8corner, axis=0)
+    # L1 概览与空候选提示（受 angle_config.verbose 控制）
+    verbose_flag = bool(getattr(angle_config, 'verbose', False))
+    if verbose_flag:
+        en_ang = bool(enable_angle and (angle_config is not None) and getattr(angle_config, 'enable_angle_feature', False))
+        try:
+            ang_w0 = float(getattr(angle_config, 'angle_weight', 0.0)) if angle_config is not None else 0.0
+        except Exception:
+            ang_w0 = 0.0
+        method0 = getattr(angle_config, 'angle_cost_method', None) if angle_config is not None else None
+        try:
+            print(f"[L1 概览] dets={len(dets_8corner)} trks={len(trks_8corner)} enable_angle={en_ang} method={method0} angle_w={ang_w0:.3f}", flush=True)
+        except Exception:
+            pass
+        if len(dets_8corner) == 0 or len(trks_8corner) == 0:
+            try:
+                print(f"[L1 提示] 空候选: 检测={len(dets_8corner)}, 轨迹={len(trks_8corner)}", flush=True)
+            except Exception:
+                pass
     if (len(trks_8corner)==0):
         return np.empty((0, 2), dtype=int), np.arange(len(dets_8corner)), np.empty((0, 8, 3), dtype=int)
 
     iou_matrix = np.zeros((len(dets_8corner), len(trks_8corner)), dtype=np.float32)
-    # iou_matrix_emb = np.zeros((len(dets_8corner), len(trks_8corner)), dtype=np.float32)
-    # eucliDistance_matrix = np.zeros((len(dets_8corner), len(trks_8corner)), dtype=np.float32)
     # 计算运动特征
     for d, det in enumerate(dets_8corner):
         for t, trk in enumerate(trks_8corner):
             iou_matrix[d, t] = iou3d(det, trk)[0]             # det: 8 x 3, trk: 8 x 3
-            # print("更新前", iou_matrix[d, t])
             iou_matrix[d, t] = iou_matrix[d, t]/trks_confidece[t]  # 除以相应的预测置信度，得到新的关联矩阵
-            # print("更新后",iou_matrix[d, t],type(iou_matrix[d, t]),"置信度",trks_confidece[t])
-            # if np.isinf(iou_matrix[d, t]) or np.isnan(iou_matrix[d, t]):
-            # 	iou_matrix[d, t] = 0
+    # ========== 距离门控（优先）: 以中心点欧氏距离为门控 ==========
+    # 检测与轨迹中心
+    det_centers = None
+    trk_centers = None
+    try:
+        if len(detections) > 0:
+            det_centers = np.stack([np.asarray(getattr(det, 'bbox'))[:3] for det in detections], axis=0).astype(np.float32)
+        if len(trackers) > 0:
+            trk_centers = np.stack([np.asarray(getattr(trk, 'pose'))[:3] for trk in trackers], axis=0).astype(np.float32)
+    except Exception:
+        det_centers = None
+        trk_centers = None
+    dist_matrix = None
+    if det_centers is not None and trk_centers is not None and det_centers.size > 0 and trk_centers.size > 0:
+        # (dets x trks)
+        diff = det_centers[:, None, :] - trk_centers[None, :, :]
+        dist_matrix = np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
 
     if not det_app:
         if grid_off:
@@ -229,11 +257,35 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
         aw_param = 0.4
 
     matches = []
+    thr_vec = None  # IoU动态阈值
+    if len(trks_8corner) > 0:
+        thr_vec = np.array([
+            max(iou_threshold * float(getattr(trk, 'beta_t', 1.0)), 0.02)
+            for trk in trackers
+        ], dtype=np.float32)
+    # 距离动态阈值: base_dist / sqrt(beta_t)
+    # 说明: base_dist 为基础距离阈值，可按需要调整。未提供外部参数时使用默认值。
+    base_dist = 3.0
+    dist_thr_vec = None
+    if dist_matrix is not None and len(trackers) > 0:
+        betas = np.array([max(1e-6, float(getattr(trk, 'beta_t', 1.0))) for trk in trackers], dtype=np.float32)
+        dist_thr_vec = (base_dist / np.sqrt(betas)).astype(np.float32)
+
     if min(iou_matrix.shape) > 0:
-        # 可选的快速唯一匹配分支（基于IoU阈值）
-        a = (iou_matrix > iou_threshold).astype(np.int32)
+        if thr_vec is not None and thr_vec.size == iou_matrix.shape[1]:
+            a = (iou_matrix > thr_vec.reshape(1, -1)).astype(np.int32)
+        else:
+            a = (iou_matrix > iou_threshold).astype(np.int32)
+        # 距离门控优先：在唯一匹配分支前先按距离阈值过滤候选
+        if dist_thr_vec is not None and dist_thr_vec.size == iou_matrix.shape[1] and dist_matrix is not None:
+            a = (a & (dist_matrix <= dist_thr_vec.reshape(1, -1))).astype(np.int32)
         if a.sum(1).max() == 1 and a.sum(0).max() == 1:
             matched_indices = np.stack(np.where(a), axis=1)
+            if verbose_flag:
+                try:
+                    print(f"[L1 路径] unique_iou: matches={matched_indices.shape[0]}", flush=True)
+                except Exception:
+                    pass
         else:
             # 自适应外观加权
             app_matrix_det_trk = None
@@ -293,11 +345,25 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                     angle_cfg_for_call.enable_angle_feature = True
                 if hasattr(angle_cfg_for_call, 'angle_cost_sigma'):
                     angle_cfg_for_call.angle_cost_sigma = 0.35
-                if hasattr(angle_cfg_for_call, 'angle_weight'):
-                    angle_cfg_for_call.angle_weight = 0.25
             residual = max(0.0, 1.0 - w_app)
-            w_iou = residual * 0.75
-            w_ang = residual * 0.25
+            # 从 Tracker.angle_level1_weight 传入的 angle_config.angle_weight 读取角度占比（0~1），默认0.25
+            ang_share = 0.25
+            try:
+                if angle_cfg_for_call is not None and hasattr(angle_cfg_for_call, 'angle_weight'):
+                    ang_share = float(angle_cfg_for_call.angle_weight)
+            except Exception:
+                ang_share = 0.25
+            if ang_share < 0.0:
+                ang_share = 0.0
+            if ang_share > 1.0:
+                ang_share = 1.0
+            w_ang = residual * ang_share
+            w_iou = residual - w_ang
+            if verbose_flag:
+                try:
+                    print(f"[L1 概览] weights: w_app={w_app:.3f}, w_ang={w_ang:.3f}, w_iou={w_iou:.3f}, app_rel={appearance_reliable}", flush=True)
+                except Exception:
+                    pass
             weights = {
                 'iou': w_iou,
                 'velocity': 0.0,
@@ -313,13 +379,14 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 # Build angle arrays for trackers/detections
                 def _angle_from_track(trk):
                     try:
+                        # 轨迹pose格式: [x, y, z, rot_y, l, w, h]
                         if hasattr(trk, 'pose') and trk.pose is not None and len(trk.pose) >= 7:
-                            return float(trk.pose[6])
+                            return float(trk.pose[3])
                         if hasattr(trk, 'angle'):
                             return float(trk.angle)
                         if hasattr(trk, 'bbox') and trk.bbox is not None:
                             if len(trk.bbox) >= 7:
-                                return float(trk.bbox[6])
+                                return float(trk.bbox[3])
                             if len(trk.bbox) >= 5:
                                 return float(trk.bbox[4])
                     except Exception:
@@ -328,16 +395,17 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
 
                 def _angle_from_det(det):
                     try:
+                        # 检测bbox格式: [x, y, z, rot_y, l, w, h]
                         if hasattr(det, 'bbox') and det.bbox is not None:
                             if len(det.bbox) >= 7:
-                                return float(det.bbox[6])
+                                return float(det.bbox[3])
                             if len(det.bbox) >= 5:
                                 return float(det.bbox[4])
                         if hasattr(det, 'angle'):
                             return float(det.angle)
                         if isinstance(det, (list, tuple, np.ndarray)):
                             if len(det) >= 7:
-                                return float(det[6])
+                                return float(det[3])
                             if len(det) >= 5:
                                 return float(det[4])
                     except Exception:
@@ -374,14 +442,29 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                     # If per-pair weights exist, pass matrix; otherwise fall back to scalar
                     'angle': (angle_weight_matrix if (angle_weight_matrix is not None) else w_ang)
                 },
-                verbose=False
+                verbose=bool(getattr(angle_cfg_for_call, 'verbose', False))
             )
 
             # 赋值为 (dets x trks) 供 linear_assignment 使用
+            # 应用距离门控：对超出距离阈值的对置以极大代价
             final_cost = fused_cost.T
+            if dist_thr_vec is not None and dist_matrix is not None and dist_thr_vec.size == final_cost.shape[1]:
+                gate = (dist_matrix <= dist_thr_vec.reshape(1, -1))
+                # 对不满足门控的对设置极大代价
+                final_cost[~gate] = 1e9
             matched_indices = linear_assignment(final_cost)
+            if verbose_flag:
+                try:
+                    print(f"[L1 路径] fused_cost: matches={matched_indices.shape[0]}", flush=True)
+                except Exception:
+                    pass
     else:
         matched_indices = np.empty(shape=(0, 2))
+        if verbose_flag:
+            try:
+                print(f"[L1 提示] 无法构建候选对: iou_matrix形状={iou_matrix.shape}", flush=True)
+            except Exception:
+                pass
 
     unmatched_detections = []
     for d, det in enumerate(dets_8corner):
@@ -394,10 +477,37 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
             unmatched_trackers.append(t)
 
     for m in matched_indices:
-        if iou_matrix[m[0], m[1]] < iou_threshold:
+        dyn_iou_thr = iou_threshold
+        if thr_vec is not None and m[1] < thr_vec.size:
+            dyn_iou_thr = float(thr_vec[m[1]])
+        iou_ok = (iou_matrix[m[0], m[1]] >= dyn_iou_thr)
+        dist_ok = True
+        dyn_dist_thr = None
+        dist_val = None
+        if dist_thr_vec is not None and dist_matrix is not None and m[1] < dist_thr_vec.size:
+            dyn_dist_thr = float(dist_thr_vec[m[1]])
+            dist_val = float(dist_matrix[m[0], m[1]])
+            dist_ok = (dist_val <= dyn_dist_thr)
+        # 动态门控总判定
+        if (not iou_ok) or (not dist_ok):
             unmatched_detections.append(m[0])
             unmatched_trackers.append(m[1])
         else:
+            # 诊断日志: 若动态门控通过但静态门控失败，认为被RASSA拯救
+            saved_msgs = []
+            # 静态IoU门控为 iou_threshold
+            if iou_threshold is not None:
+                if iou_matrix[m[0], m[1]] < float(iou_threshold):
+                    saved_msgs.append("IoU")
+            # 静态距离门控为 base_dist
+            if dist_val is not None and dyn_dist_thr is not None:
+                if dist_val > float(base_dist):
+                    saved_msgs.append("Dist")
+            if len(saved_msgs) > 0:
+                try:
+                    print(f"[RASSA SAVED] det={m[0]} trk={m[1]} reason={'+'.join(saved_msgs)} iou={float(iou_matrix[m[0], m[1]]):.3f} dyn_iou={float(dyn_iou_thr):.3f} static_iou={float(iou_threshold):.3f} dist={(dist_val if dist_val is not None else float('nan')):.3f} dyn_dist={(dyn_dist_thr if dyn_dist_thr is not None else float('nan')):.3f} static_dist={float(base_dist):.3f}")
+                except Exception:
+                    pass
             matches.append(m.reshape(1, 2))
     if len(matches) == 0:
         matches = np.empty((0, 2), dtype=int)

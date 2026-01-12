@@ -34,6 +34,8 @@ class Track_3D:
         self.confidence = 0.97
         self.con1 = 0.96
         self.emb = emb
+        self.beta_t = 1.0
+        self.rho = 0.04
         
         # ========== 方案3: 多帧回溯 - 速度历史 ==========
         self.velocity_history = []  # [(frame_id, velocity), ...]
@@ -47,6 +49,13 @@ class Track_3D:
         self.pose = trk_3d.predict()
 
     def update_3d(self, detection_3d):
+        low_score = False
+        try:
+            sc = float(getattr(detection_3d, 'score', 1.0))
+            low_score = (sc < 0.4)
+        except Exception:
+            low_score = False
+        self._csau_skip_emb = low_score
         self.kf_3d.update(detection_3d.bbox)
         self.additional_info = detection_3d.additional_info
         self.pose = np.concatenate(self.kf_3d.kf.x[:7], axis=0)
@@ -68,8 +77,9 @@ class Track_3D:
         # 保持历史长度
         if len(self.velocity_history) > self.max_history_length:
             self.velocity_history.pop(0)
+        self.reset_rassa()
 
-    def update_emb(self, emb, alpha=0.9):
+    def update_emb(self, emb, alpha=0.8):
         self.emb = alpha * self.emb + (1 - alpha) * emb
         '''
         对更新后的嵌入向量进行归一化，以确保它具有单位范数（向量的长度为1）。
@@ -83,6 +93,9 @@ class Track_3D:
         else:
             self.state = TrackState.Tentative
 
+    def reset_rassa(self):
+        self.beta_t = 1.0
+
     def mark_missed(self):
         self.time_since_update += 1
         if self.state == TrackState.Confirmed and self.hits >= self.n_init:
@@ -95,6 +108,9 @@ class Track_3D:
             if self.time_since_update > 1:
                 # print(self.time_since_update)
                 self.confidence *= self.con1**self.time_since_update
+        self.beta_t *= (1.0 - self.rho)
+        if self.beta_t < 0.1:
+            self.beta_t = 0.1
 
     def fusion_state(self):
         if  self.fusion_time_update >= 2:

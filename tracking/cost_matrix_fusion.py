@@ -225,8 +225,12 @@ def compute_fused_cost_matrix(
             cost_dict['angle'] = angle_cost
             
             if verbose:
-                print(f"[角度特征] 启用, 方法={angle_config.angle_cost_method}, "
-                      f"权重={weights.get('angle', 0.0):.3f}")
+                try:
+                    w = weights.get('angle', 0.0)
+                    w_disp = float(w) if np.isscalar(w) else float(np.mean(np.asarray(w)))
+                except Exception:
+                    w_disp = 0.0
+                print(f"[角度特征] 启用, 方法={angle_config.angle_cost_method}, 权重~{w_disp:.3f}")
         
         except Exception as e:
             if verbose:
@@ -258,14 +262,16 @@ def get_track_angle(track):
     """从轨迹对象中提取角度 (优先3D yaw)"""
     # 优先 Track_3D.pose[6]
     if hasattr(track, 'pose') and isinstance(track.pose, (list, tuple, np.ndarray)) and len(track.pose) >= 7:
-        return track.pose[6]
+        # pose 格式: [x, y, z, rot_y, l, w, h]
+        return track.pose[3]
     # 其次 track.angle
     if hasattr(track, 'angle'):
         return track.angle
     # 再次 bbox[6] 或 bbox[4]
     if hasattr(track, 'bbox') and isinstance(track.bbox, (list, tuple, np.ndarray)):
         if len(track.bbox) >= 7:
-            return track.bbox[6]
+            # bbox 格式: [x, y, z, rot_y, l, w, h]
+            return track.bbox[3]
         if len(track.bbox) >= 5:
             return track.bbox[4]
     return 0.0
@@ -275,14 +281,15 @@ def get_detection_angle(detection):
     """从检测对象中提取角度 (优先3D yaw)"""
     if hasattr(detection, 'bbox') and isinstance(detection.bbox, (list, tuple, np.ndarray)):
         if len(detection.bbox) >= 7:
-            return detection.bbox[6]
+            # bbox 格式: [x, y, z, rot_y, l, w, h]
+            return detection.bbox[3]
         if len(detection.bbox) >= 5:
             return detection.bbox[4]
     if hasattr(detection, 'angle'):
         return detection.angle
     if isinstance(detection, (list, tuple, np.ndarray)):
         if len(detection) >= 7:
-            return detection[6]
+            return detection[3]
         if len(detection) >= 5:
             return detection[4]
     return 0.0
