@@ -396,6 +396,14 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
             matched_pairs.append((track, det, fid, dt, decay))
             if config.verbose:
                 print(f"[多帧关联-GLOBAL] 轨迹{track.track_id_3d} ⇐ 帧{fid} (Δt={dt}) 代价={pair_cost:.4f}")
+        
+        # 统计 Δt 分布
+        if len(matched_pairs) > 0:
+            dt_list = [dt for _, _, _, dt, _ in matched_pairs]
+            from collections import Counter
+            dt_dist = Counter(dt_list)
+            print(f"[L2.5 Δt分布] 总匹配={len(matched_pairs)}, 分布={dict(sorted(dt_dist.items()))}")
+        
         return matched_pairs
 
     # 路径2：保留原贪心（回退）

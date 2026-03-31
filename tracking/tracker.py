@@ -59,22 +59,23 @@ class Tracker:
         # ========== 多帧关联配置 ==========
         self.multi_frame_config = MultiFrameBacktrackConfig()
         self.multi_frame_config.vmax_for_adaptive_weight = 12.0
-        self.multi_frame_config.enable_multi_frame_backtrack = False  # ✅ 启用多帧回溯（L2.5）
+        self.multi_frame_config.enable_multi_frame_backtrack = True  # ✅ 启用多帧回溯（L2.5）
         self.multi_frame_config.min_backtrack_age = 4
         self.multi_frame_config.max_backtrack_age = 15
         self.multi_frame_config.lambda_decay = 0.15
         self.multi_frame_config.cost_threshold = -0.35
         self.multi_frame_config.last_k_frames = 5
+        self.multi_frame_config.detection_buffer_size = 5
         self.multi_frame_config.topk_per_frame = 1
         self.multi_frame_config.verbose = False
         self.multi_frame_config.appearance_weight = 0.2
-        self.multi_frame_config.appearance_hard_gate = 0.55
+        self.multi_frame_config.appearance_hard_gate = 0.50
         self.enable_angle_in_level1 = True        # 启用角度特征（创新开启）
         self.enable_angle_gate_in_backtrack = False
         self.angle_level1_weight = 0.35
         self.angle_level1_method = 'gaussian'
         self.angle_level1_sigma = 0.35
-        self.angle_level1_gate_threshold = math.radians(45)
+        self.angle_level1_gate_threshold = math.radians(60)
         self.angle_backtrack_method = 'gaussian'
         self.angle_backtrack_sigma = 0.30
         self.angle_backtrack_gate_threshold = math.radians(60)
@@ -82,7 +83,7 @@ class Tracker:
         self.angle_config.enable_angle_feature = self.enable_angle_in_level1
         self.angle_config.angle_cost_method = self.angle_level1_method
         self.angle_config.angle_cost_sigma = self.angle_level1_sigma
-        self.angle_config.enable_angle_gate = False   # 启用角度门控（创新开启）
+        self.angle_config.enable_angle_gate = True   # 启用角度门控（创新开启）
         self.angle_config.angle_gate_threshold = self.angle_level1_gate_threshold
         self.angle_config.angle_weight = self.angle_level1_weight
         self.angle_config.verbose = False
@@ -362,9 +363,25 @@ class Tracker:
         self.unmatch_tracks_3d1 = [t for t in self.tracks_3d if t.time_since_update > 0]
         t2 = time.time()
         iou_shreshold=0.01
+        try:
+            self.angle_config.angle_weight = 0.45
+            self.angle_config.gamma_min = 0.30
+            self.angle_config.penalty_enable = True
+            self.angle_config.penalty_threshold_rad = math.radians(60)
+            self.angle_config.penalty_factor = 1.3
+            self.angle_config.penalty_iou_floor = 0.005
+            self.angle_config.rescue_enable = True
+            self.angle_config.rescue_angle_thr_rad = math.radians(25)
+            self.angle_config.rescue_app_thr = 0.55
+            self.angle_config.rescue_iou_floor = 0.005
+            self.angle_config.rescue_dist_relax = False
+            self.angle_config.rescue_dist_relax_ratio = 1.0
+            self.angle_config.verbose = True
+        except Exception:
+            pass
         matched_only_idx, unmatched_dets_only_idx, _ = associate_detections_to_trackers_fusion(
             detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
-            det_embs=dets_3D_only_embs, det_app=self.app_off, appearance_weight=self.appearance_weight_level1)
+            det_embs=dets_3D_only_embs, det_app=self.app_off, angle_config=self.angle_config, enable_angle=self.enable_angle_in_level1, appearance_weight=self.appearance_weight_level1)
         index_to_delete = []
         for detection_idx, track_idx in matched_only_idx:
             for index, t in enumerate(self.tracks_3d):
@@ -394,12 +411,25 @@ class Tracker:
             t25 = time.time()
 
             unmatched_trks_mf = list(self.unmatch_tracks_3d1)
-            multi_frame_matches = multi_frame_backtrack_association(
-                unmatched_trks_mf,
-                self.detection_history,
-                self.current_frame,
-                self.multi_frame_config
-            )
+
+            # ========== 使用深度学习增强的回溯（如果启用） ==========
+            if hasattr(self, 'use_dl_backtrack') and self.use_dl_backtrack:
+                from backtrack_depth_learning.dl_backtrack_integration import dl_enhanced_backtrack_association
+                multi_frame_matches = dl_enhanced_backtrack_association(
+                    unmatched_trks_mf,
+                    self.detection_history,
+                    self.current_frame,
+                    self.multi_frame_config,
+                    predictor=getattr(self, 'dl_predictor', None)
+                )
+            else:
+                # 使用原始方法
+                multi_frame_matches = multi_frame_backtrack_association(
+                    unmatched_trks_mf,
+                    self.detection_history,
+                    self.current_frame,
+                    self.multi_frame_config
+                )
 
             if len(multi_frame_matches) > 0:
                 updated_tracks = process_multi_frame_matches(
