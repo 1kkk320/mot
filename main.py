@@ -1,4 +1,4 @@
-from __future__ import print_function
+﻿from __future__ import print_function
 import os, numpy as np, time, cv2, torch
 from os import listdir
 from os.path import join
@@ -315,6 +315,12 @@ def main():
 
         i += 1
         print('--------------The time it takes to process all datasets are {}s --------------'.format(total_time))
+    
+    # 输出 L1.5 和 L2.5 恢复统计
+    print('============== 轨迹恢复统计 ==============')
+    print(f'L1.5 (速度回溯) 总恢复: {tracker.tracker.total_L15_recoveries}')
+    print(f'L2.5 (多帧回溯) 总恢复: {tracker.tracker.total_L25_recoveries}')
+    print('===========================================')
     
     # Per-level timing summary
     t1 = tracker.tracker.t_L1

@@ -18,7 +18,7 @@ class TrackState3Dor2D:
 
 
 class Track_3D:
-    def __init__(self, pose, kf_3d, track_id_3d, n_init, max_age,additional_info,emb = None, feature=None):
+    def __init__(self, pose, kf_3d, track_id_3d, n_init, max_age, additional_info, emb=None, feature=None, init_frame=0):
         self.pose = pose
         self.kf_3d = kf_3d
         self.track_id_3d = track_id_3d
@@ -39,16 +39,16 @@ class Track_3D:
         
         # ========== 方案3: 多帧回溯 - 速度历史 ==========
         self.velocity_history = []  # [(frame_id, velocity), ...]
-        self.max_history_length = 5  # 保留最近5帧
+        self.max_history_length = 10  # 保留最近10帧（方法2需要更长历史）
         
-        # 初始化第一帧速度
+        # 初始化第一帧速度（使用全局帧号）
         initial_velocity = self.kf_3d.kf.x[7:10].flatten()
-        self.velocity_history.append((self.age, initial_velocity.copy()))
+        self.velocity_history.append((init_frame, initial_velocity.copy()))
 
     def predict_3d(self, trk_3d):
         self.pose = trk_3d.predict()
 
-    def update_3d(self, detection_3d):
+    def update_3d(self, detection_3d, current_frame=None):
         low_score = False
         try:
             sc = float(getattr(detection_3d, 'score', 1.0))
@@ -72,7 +72,9 @@ class Track_3D:
         
         # ========== 方案3: 记录速度历史 ==========
         current_velocity = self.kf_3d.kf.x[7:10].flatten()
-        self.velocity_history.append((self.age, current_velocity.copy()))
+        # 使用全局帧号（如果提供），否则使用 age
+        frame_id = current_frame if current_frame is not None else self.age
+        self.velocity_history.append((frame_id, current_velocity.copy()))
         
         # 保持历史长度
         if len(self.velocity_history) > self.max_history_length:

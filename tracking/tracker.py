@@ -50,6 +50,10 @@ class Tracker:
         self.adaptive_threshold_mid = 0.60
         self.adaptive_threshold_high = 0.70
         
+        # ========== 统计计数器 ==========
+        self.total_L15_recoveries = 0            # L1.5 总恢复数
+        self.total_L25_recoveries = 0            # L2.5 总恢复数
+        
         # ========== 方案3: 多帧回溯参数 ==========
         self.use_velocity_trend = True           # 启用速度趋势（创新开启）
         self.use_smooth_velocity = True          # 启用速度平滑（创新开启）
@@ -70,6 +74,9 @@ class Tracker:
         self.multi_frame_config.verbose = False
         self.multi_frame_config.appearance_weight = 0.2
         self.multi_frame_config.appearance_hard_gate = 0.50
+        self.multi_frame_config.use_nonlinear_backtrack = False  # 基础开关保持关闭
+        self.multi_frame_config.use_acceleration_gate = True   # ✅ 启用加速度门控
+        self.multi_frame_config.acceleration_threshold = 1.5   # 加速度阈值 (m/s²)
         self.enable_angle_in_level1 = True        # 启用角度特征（创新开启）
         self.enable_angle_gate_in_backtrack = False
         self.angle_level1_weight = 0.35
@@ -269,7 +276,7 @@ class Tracker:
             enable_angle=self.enable_angle_in_level1, appearance_weight=self.appearance_weight_level1)
         print(f"[L1.5调试] L1未匹配统计: 检测={len(unmatched_dets_fusion_idx)}, 轨迹={len(unmatched_trks_fusion_idx)}", flush=True)
         for detection_idx, track_idx in matched_fusion_idx:
-            self.tracks_3d[track_idx].update_3d(detection_3D_fusion[detection_idx])
+            self.tracks_3d[track_idx].update_3d(detection_3D_fusion[detection_idx], current_frame=self.current_frame)
             if use_app_L1 and dets_3D_fusion_embs.shape[0] > detection_idx:
                 # 软更新策略：低分数采用极小步长
                 alpha_use = None
@@ -320,7 +327,8 @@ class Tracker:
                 original_trk_idx = unmatched_trks_fusion_idx[trk_idx]
                 
                 self.tracks_3d[original_trk_idx].update_3d(
-                    detection_3D_fusion[original_det_idx]
+                    detection_3D_fusion[original_det_idx],
+                    current_frame=self.current_frame
                 )
                 if not self.app_off:
                     # 软更新策略：低分数采用极小步长
@@ -349,6 +357,7 @@ class Tracker:
             
             if len(velocity_matched) > 0:
                 print(f"[速度回溯] 📊 本帧匹配成功: {len(velocity_matched)}对", flush=True)
+                self.total_L15_recoveries += len(velocity_matched)  # 累计统计
             self.last_t_L15 = time.time() - t1
         else:
             if self.velocity_backtrack_enabled:
@@ -386,7 +395,7 @@ class Tracker:
         for detection_idx, track_idx in matched_only_idx:
             for index, t in enumerate(self.tracks_3d):
                 if t.track_id_3d == self.unmatch_tracks_3d1[track_idx].track_id_3d:
-                    t.update_3d(detection_3D_only[detection_idx])
+                    t.update_3d(detection_3D_only[detection_idx], current_frame=self.current_frame)
                     if not self.app_off:
                         # 软更新策略：低分数采用极小步长（若无score则按固定alpha）
                         try:
@@ -463,6 +472,7 @@ class Tracker:
                                 break
 
                 print(f"[多帧回溯] 📊 本帧匹配成功: {len(multi_frame_matches)}对")
+                self.total_L25_recoveries += len(multi_frame_matches)  # 累计统计
             else:
                 print(f"[多帧关联] ❌ 未找到匹配")
             self.last_t_L25 = time.time() - t25
@@ -810,7 +820,7 @@ class Tracker:
         self.kf_3d = KalmanBoxTracker(detection.bbox)
         self.additional_info = detection.additional_info
         pose = np.concatenate(self.kf_3d.kf.x[:7], axis=0)
-        self.tracks_3d.append(Track_3D(pose, self.kf_3d, self.track_id_3d, self.n_init, self.max_age,self.additional_info,emb))
+        self.tracks_3d.append(Track_3D(pose, self.kf_3d, self.track_id_3d, self.n_init, self.max_age, self.additional_info, emb, init_frame=self.current_frame))
         self.track_id_3d += 2
 
     def _initiate_track_2d(self, detection,emb):

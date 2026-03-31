@@ -45,6 +45,11 @@ class MultiFrameBacktrackConfig:
         self.uncertainty_norm = 3.0
         # 使用全局最优（线性分配）代替贪心
         self.use_global_assignment = True
+        # 非线性回推开关（考虑加速度）
+        self.use_nonlinear_backtrack = False    # 基础开关
+        # 加速度门控：只在加速度显著时使用非线性
+        self.use_acceleration_gate = True       # ✅ 启用加速度门控
+        self.acceleration_threshold = 1.5       # 加速度阈值 (m/s²)，超过此值才用非线性
 
 
 def compute_decay_factor(time_diff, lambda_decay=0.1):
@@ -62,21 +67,96 @@ def compute_decay_factor(time_diff, lambda_decay=0.1):
     return decay
 
 
-def get_pose_at_past_frame(track, time_diff):
+def get_pose_at_past_frame(track, time_diff, use_nonlinear=True, verbose=False, config=None):
     """
     基于当前KF状态，将轨迹回推 time_diff 帧，返回回推后的7维pose，不修改原状态。
+    
+    Args:
+        track: 轨迹对象
+        time_diff: 回推的帧数
+        use_nonlinear: 是否使用非线性回推（考虑加速度）
+        verbose: 是否输出调试信息
+        config: MultiFrameBacktrackConfig 配置对象
+    
+    Returns:
+        pose: 7维pose [x, y, z, theta, l, w, h]
     """
     try:
         x = track.kf_3d.kf.x.copy()
-        pos = (x[:3].reshape(3) - x[7:10].reshape(3) * float(time_diff))
+        current_pos = x[:3].reshape(3)
         theta = float(x[3])
         size = x[4:7].reshape(3)
+        
+        # 加速度门控：只在加速度显著时使用非线性
+        use_acceleration_gate = getattr(config, 'use_acceleration_gate', False) if config else False
+        acceleration_threshold = getattr(config, 'acceleration_threshold', 1.5) if config else 1.5
+        
+        # 方法2：使用历史时刻的速度和加速度（更物理准确）
+        if use_nonlinear and hasattr(track, 'velocity_history') and len(track.velocity_history) >= 2:
+            current_frame = track.velocity_history[-1][0] if len(track.velocity_history) > 0 else 0
+            target_frame = current_frame - time_diff
+            
+            # 从速度历史中查找目标帧附近的速度
+            v_at_target = None
+            a_at_target = None
+            
+            # 查找最接近目标帧的速度记录
+            for i in range(len(track.velocity_history) - 1, -1, -1):
+                frame_id, vel = track.velocity_history[i]
+                if frame_id <= target_frame:
+                    v_at_target = vel
+                    # 计算该时刻的加速度（如果有前一个速度点）
+                    if i > 0:
+                        prev_frame, prev_vel = track.velocity_history[i-1]
+                        dt = max(frame_id - prev_frame, 1)
+                        a_at_target = (vel - prev_vel) / dt
+                    break
+            
+            # 如果找到了历史速度，使用历史速度回推
+            if v_at_target is not None:
+                dt = float(time_diff)
+                v_current = x[7:10].reshape(3)
+                
+                # 加速度门控判断
+                use_nonlinear_for_this = True
+                if use_acceleration_gate and a_at_target is not None:
+                    a_norm = float(np.linalg.norm(a_at_target))
+                    if a_norm < acceleration_threshold:
+                        # 加速度不显著，使用线性回推
+                        use_nonlinear_for_this = False
+                        if verbose and np.random.rand() < 0.01:
+                            print(f"[加速度门控] |a|={a_norm:.3f} < {acceleration_threshold:.3f}, 使用线性回推")
+                    else:
+                        if verbose and np.random.rand() < 0.01:
+                            print(f"[加速度门控] |a|={a_norm:.3f} >= {acceleration_threshold:.3f}, 使用非线性回推")
+                
+                if verbose and np.random.rand() < 0.01:  # 1%概率输出，避免刷屏
+                    v_norm_target = float(np.linalg.norm(v_at_target))
+                    v_norm_current = float(np.linalg.norm(v_current))
+                    print(f"[历史速度回推] Δt={dt:.0f}, v_target={v_norm_target:.2f}, v_current={v_norm_current:.2f}, 差异={abs(v_norm_target-v_norm_current):.2f}")
+                
+                if use_nonlinear_for_this and a_at_target is not None:
+                    # 使用历史时刻的速度和加速度（非线性）
+                    pos = current_pos - v_at_target * dt - 0.5 * a_at_target * (dt ** 2)
+                else:
+                    # 只有速度，没有加速度，或加速度不显著（线性）
+                    pos = current_pos - v_at_target * dt
+            else:
+                # 没找到历史速度，降级到使用当前速度
+                v_current = x[7:10].reshape(3)
+                pos = current_pos - v_current * float(time_diff)
+        else:
+            # 线性回推（原始方法）
+            v_current = x[7:10].reshape(3)
+            pos = current_pos - v_current * float(time_diff)
+        
         pose = np.zeros(7, dtype=np.float32)
         pose[0:3] = pos
         pose[3] = theta
         pose[4:7] = size
         return pose
-    except Exception:
+    except Exception as e:
+        # 降级到简单线性回推
         v = get_velocity(track)
         pos = track.pose[:3] - v[:3] * float(time_diff)
         pose = np.zeros(7, dtype=np.float32)
@@ -219,7 +299,8 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
         for det in detections:
             # 相似度项（不使用角/角速度）
             # 方案A：将轨迹回推到历史帧，与历史检测计算IoU
-            rollback_pose = get_pose_at_past_frame(track, dt)
+            use_nonlinear = getattr(config, 'use_nonlinear_backtrack', True)
+            rollback_pose = get_pose_at_past_frame(track, dt, use_nonlinear=use_nonlinear, config=config)
             iou = compute_iou_3d(rollback_pose, det.bbox)
             if iou <= 1e-6:
                 continue
@@ -326,7 +407,8 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                 if not (config.min_backtrack_age <= track.time_since_update <= config.max_backtrack_age):
                     continue
                 # 相似度项
-                rollback_pose = get_pose_at_past_frame(track, dt)
+                use_nonlinear = getattr(config, 'use_nonlinear_backtrack', True)
+                rollback_pose = get_pose_at_past_frame(track, dt, use_nonlinear=use_nonlinear, config=config)
                 iou = compute_iou_3d(rollback_pose, det.bbox)
                 if iou <= 1e-6:
                     continue
