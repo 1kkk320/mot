@@ -10,7 +10,7 @@ from tracking.matching import associate_detections_to_trackers_fusion, associate
 from tracking.track_2d import Track_2D
 from tracking.kalman_fileter_3d import  KalmanBoxTracker
 from tracking.track_3d import Track_3D, TrackState
-from trackers.ocsort_embedding.embedding import EmbeddingComputer
+from trackers.integrated_ocsort_embedding.embedding_veri import EmbeddingComputerVeRi
 from tracking.matching import compute_aw_new_metric
 from tracking.angle_feature import AngleFeatureConfig, compute_angle_similarity_matrix
 from tracking.multi_frame_backtrack import (MultiFrameBacktrackConfig, 
@@ -35,20 +35,25 @@ class Tracker:
         self.grid_off = grid_off
         self.app_off = app_off
         self.mot_off = False
-        self.embedder = EmbeddingComputer(grid_off=self.grid_off)
-        self.appearance_weight_level1 = kwargs.get('appearance_weight_level1', 0.15)
+        self.embedder = EmbeddingComputerVeRi(
+            dataset="kitti",  # 使用KITTI数据集标识
+            test_dataset=True,  # 测试模式
+            grid_off=self.grid_off,
+            max_batch=64  # 适合RTX 4060Ti的批次大小
+        )
+        self.appearance_weight_level1 = kwargs.get('appearance_weight_level1', 0.20)  # 🔧 调优: 0.15 → 0.20
         
         # ========== 速度自适应回溯关联参数 ==========
         self.velocity_backtrack_enabled = True   # 启用速度回溯（创新开启）
-        self.velocity_threshold = 0.6            # 速度相似度阈值
+        self.velocity_threshold = 0.55           # 🔧 调优: 0.6 → 0.55 (更宽松)
         self.velocity_weight = 0.5               # 默认速度权重 (0.5表示速度和位置各占50%)
         self.adaptive_weight = True              # 启用自适应速度权重 (方案B)
         self.detection_history = {}              # 历史检测缓存 {frame_id: detections}
         self.current_frame = 0                   # 当前帧计数
         self.velocity_weight_vmax = 12.0
-        self.adaptive_threshold_low = 0.55
-        self.adaptive_threshold_mid = 0.60
-        self.adaptive_threshold_high = 0.70
+        self.adaptive_threshold_low = 0.50       # 🔧 调优: 0.55 → 0.50
+        self.adaptive_threshold_mid = 0.55       # 🔧 调优: 0.60 → 0.55
+        self.adaptive_threshold_high = 0.65      # 🔧 调优: 0.70 → 0.65
         
         # ========== 统计计数器 ==========
         self.total_L15_recoveries = 0            # L1.5 总恢复数
@@ -67,16 +72,19 @@ class Tracker:
         self.multi_frame_config.min_backtrack_age = 4
         self.multi_frame_config.max_backtrack_age = 15
         self.multi_frame_config.lambda_decay = 0.15
-        self.multi_frame_config.cost_threshold = -0.35
+        self.multi_frame_config.cost_threshold = -0.30  # 🔧 调优: -0.35 → -0.30 (更宽松)
         self.multi_frame_config.last_k_frames = 5
         self.multi_frame_config.detection_buffer_size = 5
         self.multi_frame_config.topk_per_frame = 1
         self.multi_frame_config.verbose = False
-        self.multi_frame_config.appearance_weight = 0.2
-        self.multi_frame_config.appearance_hard_gate = 0.50
+        self.multi_frame_config.appearance_weight = 0.25  # 🔧 调优: 0.2 → 0.25
+        self.multi_frame_config.appearance_hard_gate = 0.45  # 🔧 调优: 0.50 → 0.45 (更宽松)
         self.multi_frame_config.use_nonlinear_backtrack = False  # 基础开关保持关闭
         self.multi_frame_config.use_acceleration_gate = True   # ✅ 启用加速度门控
         self.multi_frame_config.acceleration_threshold = 1.5   # 加速度阈值 (m/s²)
+        self.multi_frame_config.use_soft_gate = True           # ✅ 启用软门控（k=2.0）
+        self.multi_frame_config.soft_gate_sharpness = 2.0      # 陡峭度参数
+        # 加速度平滑和速度平滑已移除（在KITTI上无效果）
         self.enable_angle_in_level1 = True        # 启用角度特征（创新开启）
         self.enable_angle_gate_in_backtrack = False
         self.angle_level1_weight = 0.35
@@ -219,19 +227,25 @@ class Tracker:
         dets_2D_only_embs = np.ones((len(detection_2D_only), 1))
 
         det_3D_fusion_bboxs = [det_3d_f.additional_info[2:6] for det_3d_f in detection_3D_fusion]
+        det_3D_fusion_bboxs = np.array(det_3D_fusion_bboxs) if len(det_3D_fusion_bboxs) > 0 else np.empty((0, 4))  # 转换为numpy数组
         dets_fusion_alpha = None
         dets_2d_only_alpha = None
-        # 恢复：一级使用外观（若未关闭embedding）
+        # 恢复：一级使用外观（若未关闭embedding且未关闭外观）
         use_app_L1 = True
-        if use_app_L1 and not self.embedding_off and len(detection_3D_fusion) > 0:
-            dets_3D_fusion_embs = self.embedder.compute_embedding(img, det_3D_fusion_bboxs)
+        if use_app_L1 and not self.embedding_off and not self.app_off and len(detection_3D_fusion) > 0:
+            tag = f"kitti:{self.current_frame:06d}_fusion"  # 添加类型后缀
+            dets_3D_fusion_embs = self.embedder.compute_embedding(img, det_3D_fusion_bboxs, tag)
         # 二级/三级：为仅3D与仅2D检测计算外观特征（若未关闭embedding且允许使用外观）
         if not self.embedding_off and not self.app_off and len(detection_3D_only) > 0:
             det_3D_only_bboxs = [det_3d_o.additional_info[2:6] for det_3d_o in detection_3D_only]
-            dets_3D_only_embs = self.embedder.compute_embedding(img, det_3D_only_bboxs)
+            det_3D_only_bboxs = np.array(det_3D_only_bboxs)  # 转换为numpy数组
+            tag = f"kitti:{self.current_frame:06d}_3d_only"  # 添加类型后缀
+            dets_3D_only_embs = self.embedder.compute_embedding(img, det_3D_only_bboxs, tag)
         if not self.embedding_off and not self.app_off and len(detection_2D_only) > 0:
             det_2D_only_bboxs = [det.to_x1y1x2y2() for det in detection_2D_only]
-            dets_2D_only_embs = self.embedder.compute_embedding(img, det_2D_only_bboxs)
+            det_2D_only_bboxs = np.array(det_2D_only_bboxs)  # 转换为numpy数组
+            tag = f"kitti:{self.current_frame:06d}_2d_only"  # 添加类型后缀
+            dets_2D_only_embs = self.embedder.compute_embedding(img, det_2D_only_bboxs, tag)
         if len(detection_3D_fusion_conf) != 0:
             trust_fusion = np.asarray([(i - self.det_thresh) / (1 - self.det_thresh) for i in detection_3D_fusion_conf])
         else:

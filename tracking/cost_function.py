@@ -208,9 +208,7 @@ def get_velocity(track):
         velocity: [dx, dy, dz] 速度向量 (m/s)
     """
     if hasattr(track, 'kf_3d') and hasattr(track.kf_3d, 'kf'):
-        # 提取速度状态 (索引7,8,9对应dx,dy,dz)
-        velocity = track.kf_3d.kf.x[7:10].flatten()
-        return velocity
+        return track.kf_3d.kf.x[7:10].flatten()
     else:
         return np.zeros(3)
 
@@ -255,6 +253,13 @@ def estimate_detection_velocity(detection, prev_detections, frame_id):
     
     Returns:
         velocity: 估计的速度 [dx, dy, dz] (m/s)
+    """
+    return estimate_detection_velocity_simple(detection, prev_detections, frame_id)
+
+
+def estimate_detection_velocity_simple(detection, prev_detections, frame_id):
+    """
+    简单2帧差分估计速度（原方法）
     """
     # 如果没有历史帧,返回零速度
     if frame_id - 1 not in prev_detections:

@@ -34,7 +34,7 @@ class DeepFusion(object):
         '''
         self.max_age = max_age
         self.min_hits = min_hits
-        self.tracker = Tracker(max_age, min_hits, grid_off=True, app_off=True)
+        self.tracker = Tracker(max_age, min_hits, grid_off=True, app_off=False)
         self.reorder = [3, 4, 5, 6, 2, 1, 0]
         self.reorder_back = [6, 5, 4, 0, 1, 2, 3]
         self.frame_count = 0
