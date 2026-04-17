@@ -1,5 +1,5 @@
 ﻿from __future__ import print_function
-import os, numpy as np, time, cv2, torch
+import os, numpy as np, time, cv2, torch, math
 from os import listdir
 from os.path import join
 from file_operation.file import load_list_from_folder, mkdir_if_inexistence, fileparts
@@ -34,7 +34,7 @@ class DeepFusion(object):
         '''
         self.max_age = max_age
         self.min_hits = min_hits
-        self.tracker = Tracker(max_age, min_hits, grid_off=True, app_off=False)
+        self.tracker = Tracker(max_age, min_hits, grid_off=True, app_off=True)
         self.reorder = [3, 4, 5, 6, 2, 1, 0]
         self.reorder_back = [6, 5, 4, 0, 1, 2, 3]
         self.frame_count = 0
@@ -165,19 +165,69 @@ def main():
             open(os.path.join(txt_path_0, name + '.txt'), 'w').close()
 
     total_time, total_frames, i = 0.0, 0, 0  # Tracker runtime, total frames and Serial number of the dataset、跟踪器运行时，总时间、总帧数和数据集的序列号
-    tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)  # 实验1B: 降低IoU阈值到0.22以进一步减少ID Switch
-    # 关闭 L1.5 速度回溯（干净基线）
-    tracker.tracker.velocity_backtrack_enabled = True
-    # 恢复外观特征提取（embedding_off=False）
-    tracker.tracker.embedding_off = False
-    tracker.tracker.enable_angle_in_level1 = True
-    tracker.tracker.angle_config.enable_angle_feature = True
-    # 启用角度融合调试输出（将在融合阶段打印 angle 的权重与代价范围）
-    tracker.tracker.angle_config.verbose = True
-    # 开启 L2.5 多帧历史回溯
-    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True
+    tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)
     
-
+    # ========== 实验9配置：全部创新点启用 ==========
+    
+    # ========== 创新点1: 角度特征（路径感知权重增强） ==========
+    tracker.tracker.enable_angle_in_level1 = True  # ✅ 启用角度特征
+    tracker.tracker.angle_config.enable_angle_feature = True  # ✅ 启用角度特征
+    
+    # 基础角度配置
+    tracker.tracker.angle_config.angle_cost_method = 'symmetric'  # 对称性方法
+    tracker.tracker.angle_config.angle_cost_sigma = 0.45  # 0.45 (25.8°)
+    tracker.tracker.angle_config.angle_weight = 0.50  # 基础权重0.50
+    tracker.tracker.angle_config.angle_gate_threshold = math.radians(52)  # 52°
+    tracker.tracker.angle_config.gamma_min = 0.20  # 0.20
+    
+    # ✅ 启用路径感知权重增强
+    tracker.tracker.angle_config.enable_path_aware_weighting = True  # 启用
+    tracker.tracker.angle_config.fused_cost_angle_boost = 1.8  # 增强1.8倍
+    # 效果：fused_cost路径中，角度权重从0.50增强到0.90
+    
+    # ❌ 禁用身份冲突校验（实验8失败）
+    tracker.tracker.angle_config.enable_angle_conflict_check = False  # 禁用
+    
+    # 保持外观权重
+    tracker.tracker.appearance_weight_level1 = 0.10  # 0.10
+    
+    # 优化速度自适应参数
+    tracker.tracker.adaptive_threshold_low = 0.40  # 0.40
+    tracker.tracker.adaptive_threshold_high = 0.70  # 0.70
+    
+    tracker.tracker.angle_config.verbose = False  # 关闭调试输出
+    
+    # ========== 创新点2: L1.5速度回溯 ==========
+    tracker.tracker.velocity_backtrack_enabled = True  # ✅ 启用L1.5速度回溯
+    tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
+    tracker.tracker.adaptive_weight = True  # 启用自适应速度权重
+    tracker.tracker.velocity_weight_vmax = 12.0  # 速度归一化最大值
+    tracker.tracker.use_velocity_trend = True  # 启用速度趋势
+    tracker.tracker.use_smooth_velocity = True  # 启用速度平滑
+    tracker.tracker.velocity_smooth_window = 3  # 速度平滑窗口
+    tracker.tracker.trend_weight = 0.3  # 趋势权重
+    
+    # ========== 创新点3: L2.5多帧回溯 ==========
+    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True  # ✅ 启用L2.5多帧回溯
+    tracker.tracker.multi_frame_config.min_backtrack_age = 4  # 最小回溯年龄
+    tracker.tracker.multi_frame_config.max_backtrack_age = 15  # 最大回溯年龄
+    tracker.tracker.multi_frame_config.lambda_decay = 0.15  # 时间衰减系数
+    tracker.tracker.multi_frame_config.cost_threshold = -0.35  # 代价阈值
+    tracker.tracker.multi_frame_config.last_k_frames = 5  # 回溯帧数
+    tracker.tracker.multi_frame_config.detection_buffer_size = 5  # 检测缓冲大小
+    tracker.tracker.multi_frame_config.topk_per_frame = 1  # 每帧top-k
+    tracker.tracker.multi_frame_config.appearance_weight = 0.2  # 外观权重
+    tracker.tracker.multi_frame_config.appearance_hard_gate = 0.50  # 外观硬门控
+    tracker.tracker.multi_frame_config.verbose = False  # 关闭调试输出
+    
+    # ========== 创新点4: 加速度门控 ==========
+    tracker.tracker.multi_frame_config.use_acceleration_gate = True  # ✅ 启用加速度门控
+    tracker.tracker.multi_frame_config.acceleration_threshold = 1.5  # 加速度阈值 (m/s²)
+    
+    # ========== 其他配置 ==========
+    tracker.tracker.embedding_off = False  # 保持外观特征提取
+    tracker.tracker.enable_angle_gate_in_backtrack = False  # L1.5中不使用角度门控
+    
     # Iterate through each data set 遍历数据集
     for seq_file_3D in detection_file_list_3D:
         seq_filename_txt, seq_id, _ = fileparts(seq_file_3D)
@@ -293,23 +343,23 @@ def main():
                         )
                         f.write(str_to_srite)
                         #show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
-            if len(trackers_2d) > 0:
-                for d in trackers_2d:
-                    bbox2d = d.flatten()
+            #if len(trackers_2d) > 0:
+                #for d in trackers_2d:
+                    #bbox2d = d.flatten()
                     # print(bbox2d,type(bbox2d))
-                    bbox2d_tmp = bbox2d[1:5]
-                    id_tmp = int(bbox2d[0])
-                    color = compute_color_for_id(id_tmp)
-                    image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
-                    label = f'{id_tmp} {"car"}'
-                    with open(txt_path, 'a') as f:
-                        type_tmp = 'car'
-                        str_to_srite = (
-                            f"{frame:d} {id_tmp:d} {type_tmp} -1 -1 -10 "
-                            f"{bbox2d_tmp[0]:.6f} {bbox2d_tmp[1]:.6f} {bbox2d_tmp[2]:.6f} {bbox2d_tmp[3]:.6f} "
-                            f"-1000 -1000 -1000 -10 -1 -1 -1 -1\n"
-                        )
-                        f.write(str_to_srite)
+                    #bbox2d_tmp = bbox2d[1:5]
+                    #id_tmp = int(bbox2d[0])
+                    #color = compute_color_for_id(id_tmp)
+                    #image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
+                    #label = f'{id_tmp} {"car"}'
+                    #with open(txt_path, 'a') as f:
+                        #type_tmp = 'car'
+                        #str_to_srite = (
+                            #f"{frame:d} {id_tmp:d} {type_tmp} -1 -1 -10 "
+                            #f"{bbox2d_tmp[0]:.6f} {bbox2d_tmp[1]:.6f} {bbox2d_tmp[2]:.6f} {bbox2d_tmp[3]:.6f} "
+                            #f"-1000 -1000 -1000 -10 -1 -1 -1 -1\n"
+                        #)
+                        #f.write(str_to_srite)
                         # plot_one_box(bbox2d,img_0,image_path,color,img0_name,label,line_thickness=1)
                         # print(image_save_path)
 
@@ -345,4 +395,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

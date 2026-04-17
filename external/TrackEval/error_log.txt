@@ -418,3 +418,45 @@ trackeval.utils.TrackEvalException: Tracking data contains the following invalid
 
 
 
+Kitti2DBox
+virconv_OCM
+Traceback (most recent call last):
+  File "E:\mot\external/TrackEval\trackeval\eval.py", line 99, in evaluate
+    res[curr_seq] = eval_sequence(
+  File "E:\mot\external/TrackEval\trackeval\_timing.py", line 17, in wrap
+    result = f(*args, **kw)
+  File "E:\mot\external/TrackEval\trackeval\eval.py", line 259, in eval_sequence
+    raw_data = dataset.get_raw_seq_data(tracker, seq)
+  File "E:\mot\external/TrackEval\trackeval\_timing.py", line 17, in wrap
+    result = f(*args, **kw)
+  File "E:\mot\external/TrackEval\trackeval\datasets\_base_dataset.py", line 93, in get_raw_seq_data
+    raw_tracker_data = self._load_raw_file(tracker, seq, is_gt=False)
+  File "E:\mot\external/TrackEval\trackeval\datasets\kitti_2d_box.py", line 240, in _load_raw_file
+    raise TrackEvalException(
+trackeval.utils.TrackEvalException: Tracking data contains the following invalid timesteps in seq 0001: 448, , 449, , 450, , 451, , 458, , 459, , 460, , 461, , 479, , 480, , 481, , 482, , 486, , 487, , 488, , 489, , 492, , 493, , 494, , 495, , 498, , 499, , 500, , 501, , 502, , 505, , 506, , 507, , 508, , 578, , 579, , 580, , 581, 
+
+
+
+
+
+Kitti2DBox
+virconv_OCM
+Traceback (most recent call last):
+  File "E:\mot\external/TrackEval\trackeval\eval.py", line 99, in evaluate
+    res[curr_seq] = eval_sequence(
+  File "E:\mot\external/TrackEval\trackeval\_timing.py", line 17, in wrap
+    result = f(*args, **kw)
+  File "E:\mot\external/TrackEval\trackeval\eval.py", line 259, in eval_sequence
+    raw_data = dataset.get_raw_seq_data(tracker, seq)
+  File "E:\mot\external/TrackEval\trackeval\_timing.py", line 17, in wrap
+    result = f(*args, **kw)
+  File "E:\mot\external/TrackEval\trackeval\datasets\_base_dataset.py", line 93, in get_raw_seq_data
+    raw_tracker_data = self._load_raw_file(tracker, seq, is_gt=False)
+  File "E:\mot\external/TrackEval\trackeval\datasets\kitti_2d_box.py", line 240, in _load_raw_file
+    raise TrackEvalException(
+trackeval.utils.TrackEvalException: Tracking data contains the following invalid timesteps in seq 0002: 716, 
+
+
+
+
+

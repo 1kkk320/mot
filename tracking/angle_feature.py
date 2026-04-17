@@ -72,6 +72,47 @@ def angle_cost_gaussian(angle_track, angle_det, sigma=0.3):
     return min(cost, 1.0)
 
 
+def angle_cost_symmetric(angle_track, angle_det, sigma=0.3):
+    """
+    对称性感知角度代价: 考虑车辆前后对称性
+    
+    核心思想: 车辆是对称的，0°和180°应该被视为相同的朝向
+    使用公式: Δθ_sym = arccos(|cos(θ_t - θ_d)|)
+    
+    效果:
+    - 0° vs 0°   → Δθ_sym = 0°   (完全一致)
+    - 0° vs 180° → Δθ_sym = 0°   (前后视角，视为一致)
+    - 0° vs 90°  → Δθ_sym = 90°  (垂直方向，不一致)
+    - 45° vs 135° → Δθ_sym = 90° (对称位置)
+    
+    Args:
+        angle_track: 轨迹角度 (弧度)
+        angle_det: 检测角度 (弧度)
+        sigma: 高斯标准差 (默认0.3弧度 ≈ 17度)
+        
+    Returns:
+        cost: [0, 1] 范围的代价值
+    """
+    if np.isnan(angle_track) or np.isnan(angle_det):
+        return 1.0
+    
+    # 计算原始角度差
+    delta_angle = wrap_to_pi(angle_track - angle_det)
+    
+    # 对称性归一化: 使用余弦的绝对值
+    # |cos(Δθ)| 在 Δθ=0° 和 Δθ=180° 时都等于 1
+    # |cos(Δθ)| 在 Δθ=90° 时等于 0
+    cos_delta = abs(math.cos(delta_angle))
+    
+    # 转换为对称角度差: arccos(|cos(Δθ)|)
+    # 范围: [0, π/2] (0° 到 90°)
+    delta_angle_sym = math.acos(np.clip(cos_delta, 0.0, 1.0))
+    
+    # 高斯惩罚: 使用对称角度差
+    cost = 1.0 - np.exp(-(delta_angle_sym ** 2) / (2 * sigma ** 2))
+    return min(cost, 1.0)
+
+
 def angle_gate(angle_track, angle_det, threshold=math.pi/2):
     """
     角度门控: 检查角度差是否超过阈值
@@ -100,7 +141,7 @@ def compute_angle_similarity_matrix(track_angles, det_angles, method='linear', s
     Args:
         track_angles: 轨迹角度数组 [n_tracks]
         det_angles: 检测角度数组 [n_dets]
-        method: 'linear' 或 'gaussian'
+        method: 'linear', 'gaussian', 或 'symmetric'
         sigma: 高斯方法的标准差
         gate_threshold: 门控阈值 (None 表示不做门控)
         
@@ -115,7 +156,9 @@ def compute_angle_similarity_matrix(track_angles, det_angles, method='linear', s
     gate_mask = np.ones((n_tracks, n_dets), dtype=bool)
     
     # 选择代价函数
-    if method == 'gaussian':
+    if method == 'symmetric':
+        cost_fn = lambda t, d: angle_cost_symmetric(t, d, sigma)
+    elif method == 'gaussian':
         cost_fn = lambda t, d: angle_cost_gaussian(t, d, sigma)
     else:
         cost_fn = lambda t, d: angle_cost_linear(t, d)
@@ -198,15 +241,31 @@ class AngleFeatureConfig:
         self.enable_angle_feature = False
         
         # 代价函数方法
-        self.angle_cost_method = 'linear'  # 'linear' 或 'gaussian'
+        # 'linear': 线性代价 c = |Δθ| / π
+        # 'gaussian': 高斯惩罚 c = 1 - exp(-Δθ^2 / (2σ^2))
+        # 'symmetric': 对称性感知 c = 1 - exp(-Δθ_sym^2 / (2σ^2))
+        #              其中 Δθ_sym = arccos(|cos(Δθ)|)
+        #              效果: 0°和180°被视为相同 (解决前后视角混淆)
+        self.angle_cost_method = 'gaussian'  # 'linear', 'gaussian', 或 'symmetric'
         self.angle_cost_sigma = 0.3        # 高斯方法的标准差 (弧度)
         
         # 门控参数
         self.enable_angle_gate = True
         self.angle_gate_threshold = math.radians(35)  # 35度
         
+        # unique_iou路径角度门控（轻量级，45度）
+        self.enable_unique_iou_angle_gate = False  # 默认关闭
+        self.unique_iou_angle_threshold = math.radians(45)  # 45度
+        
         # 融合权重
         self.angle_weight = 0.15  # 角度权重 (不要设太高, AB3DMOT 建议 0.1-0.2)
+        
+        # 路径感知权重增强（针对fused_cost路径）
+        self.enable_path_aware_weighting = True  # 默认启用
+        self.fused_cost_angle_boost = 1.8  # fused_cost路径的角度权重增强系数
+        
+        # 速度自适应参数
+        self.gamma_min = 0.20  # 低速时的最小角度权重
         
         # 角度校正 (AB3DMOT 风格)
         self.enable_orientation_correction = False  # 默认关闭, 可选启用
@@ -221,7 +280,9 @@ class AngleFeatureConfig:
             f"  enable={self.enable_angle_feature},\n"
             f"  method={self.angle_cost_method},\n"
             f"  gate={self.enable_angle_gate} (threshold={self.angle_gate_threshold:.3f}),\n"
+            f"  unique_iou_gate={self.enable_unique_iou_angle_gate} (threshold={self.unique_iou_angle_threshold:.3f}),\n"
             f"  weight={self.angle_weight},\n"
+            f"  gamma_min={self.gamma_min},\n"
             f"  correction={self.enable_orientation_correction}\n"
             f")"
         )

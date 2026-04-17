@@ -50,9 +50,6 @@ class MultiFrameBacktrackConfig:
         # 加速度门控：只在加速度显著时使用非线性
         self.use_acceleration_gate = True       # ✅ 启用加速度门控
         self.acceleration_threshold = 1.5       # 加速度阈值 (m/s²)，超过此值才用非线性
-        # 软门控参数（平滑过渡）
-        self.use_soft_gate = True               # ✅ 启用软门控（替代硬门控）
-        self.soft_gate_sharpness = 2.0          # 陡峭度（越大越接近硬门控）
 
 
 def compute_decay_factor(time_diff, lambda_decay=0.1):
@@ -68,33 +65,6 @@ def compute_decay_factor(time_diff, lambda_decay=0.1):
     """
     decay = np.exp(-lambda_decay * time_diff)
     return decay
-
-
-def soft_acceleration_gate(a_norm, threshold=1.5, sharpness=2.0):
-    """
-    软门控函数：使用 Sigmoid 函数实现平滑过渡
-    
-    Args:
-        a_norm: 加速度的模（标量）
-        threshold: 中心阈值（加速度显著性的分界点）
-        sharpness: 陡峭度（控制过渡的平滑程度）
-                   - 越大越接近硬门控（陡峭）
-                   - 越小越平滑（缓慢过渡）
-    
-    Returns:
-        weight: 非线性权重 [0, 1]
-                0 = 完全线性
-                1 = 完全非线性
-    
-    示例（threshold=1.5, sharpness=2.0）：
-        a_norm=0.5  → weight≈0.05  (几乎线性)
-        a_norm=1.0  → weight≈0.27  (偏线性)
-        a_norm=1.5  → weight=0.50  (中间)
-        a_norm=2.0  → weight≈0.73  (偏非线性)
-        a_norm=2.5  → weight≈0.92  (几乎非线性)
-    """
-    weight = 1.0 / (1.0 + np.exp(-sharpness * (a_norm - threshold)))
-    return float(weight)
 
 
 def get_pose_at_past_frame(track, time_diff, use_nonlinear=True, verbose=False, config=None):
@@ -117,11 +87,9 @@ def get_pose_at_past_frame(track, time_diff, use_nonlinear=True, verbose=False, 
         theta = float(x[3])
         size = x[4:7].reshape(3)
         
-        # 加速度门控参数
+        # 加速度门控：只在加速度显著时使用非线性
         use_acceleration_gate = getattr(config, 'use_acceleration_gate', False) if config else False
         acceleration_threshold = getattr(config, 'acceleration_threshold', 1.5) if config else 1.5
-        use_soft_gate = getattr(config, 'use_soft_gate', False) if config else False
-        soft_gate_sharpness = getattr(config, 'soft_gate_sharpness', 2.0) if config else 2.0
         
         # 方法2：使用历史时刻的速度和加速度（更物理准确）
         if use_nonlinear and hasattr(track, 'velocity_history') and len(track.velocity_history) >= 2:
@@ -137,13 +105,11 @@ def get_pose_at_past_frame(track, time_diff, use_nonlinear=True, verbose=False, 
                 frame_id, vel = track.velocity_history[i]
                 if frame_id <= target_frame:
                     v_at_target = vel
-                    # 计算该时刻的加速度（简单差分）
+                    # 计算该时刻的加速度（如果有前一个速度点）
                     if i > 0:
                         prev_frame, prev_vel = track.velocity_history[i-1]
                         dt = max(frame_id - prev_frame, 1)
                         a_at_target = (vel - prev_vel) / dt
-                        if verbose and np.random.rand() < 0.01:
-                            print(f"[简单差分] |a_simple|={float(np.linalg.norm(a_at_target)):.3f}")
                     break
             
             # 如果找到了历史速度，使用历史速度回推
@@ -152,47 +118,28 @@ def get_pose_at_past_frame(track, time_diff, use_nonlinear=True, verbose=False, 
                 v_current = x[7:10].reshape(3)
                 
                 # 加速度门控判断
-                nonlinear_weight = 0.0  # 默认完全线性
-                
+                use_nonlinear_for_this = True
                 if use_acceleration_gate and a_at_target is not None:
                     a_norm = float(np.linalg.norm(a_at_target))
-                    
-                    if use_soft_gate:
-                        # 软门控：平滑过渡
-                        nonlinear_weight = soft_acceleration_gate(
-                            a_norm, 
-                            threshold=acceleration_threshold,
-                            sharpness=soft_gate_sharpness
-                        )
-                        
+                    if a_norm < acceleration_threshold:
+                        # 加速度不显著，使用线性回推
+                        use_nonlinear_for_this = False
                         if verbose and np.random.rand() < 0.01:
-                            print(f"[软门控] |a|={a_norm:.3f}, threshold={acceleration_threshold:.1f}, "
-                                  f"weight={nonlinear_weight:.3f} ({'线性' if nonlinear_weight < 0.3 else '混合' if nonlinear_weight < 0.7 else '非线性'})")
+                            print(f"[加速度门控] |a|={a_norm:.3f} < {acceleration_threshold:.3f}, 使用线性回推")
                     else:
-                        # 硬门控：二值决策
-                        if a_norm >= acceleration_threshold:
-                            nonlinear_weight = 1.0
-                            if verbose and np.random.rand() < 0.01:
-                                print(f"[硬门控] |a|={a_norm:.3f} >= {acceleration_threshold:.1f}, 使用非线性")
-                        else:
-                            nonlinear_weight = 0.0
-                            if verbose and np.random.rand() < 0.01:
-                                print(f"[硬门控] |a|={a_norm:.3f} < {acceleration_threshold:.1f}, 使用线性")
+                        if verbose and np.random.rand() < 0.01:
+                            print(f"[加速度门控] |a|={a_norm:.3f} >= {acceleration_threshold:.3f}, 使用非线性回推")
                 
-                if verbose and np.random.rand() < 0.01:
+                if verbose and np.random.rand() < 0.01:  # 1%概率输出，避免刷屏
                     v_norm_target = float(np.linalg.norm(v_at_target))
                     v_norm_current = float(np.linalg.norm(v_current))
-                    print(f"[历史速度回推] Δt={dt:.0f}, v_target={v_norm_target:.2f}, "
-                          f"v_current={v_norm_current:.2f}, 差异={abs(v_norm_target-v_norm_current):.2f}")
+                    print(f"[历史速度回推] Δt={dt:.0f}, v_target={v_norm_target:.2f}, v_current={v_norm_current:.2f}, 差异={abs(v_norm_target-v_norm_current):.2f}")
                 
-                # 使用软门控权重混合线性和非线性
-                if a_at_target is not None and nonlinear_weight > 0:
-                    # 混合：weight * 非线性 + (1-weight) * 线性
-                    # 非线性项：-0.5 * a * dt²
-                    # 线性项：0
-                    pos = current_pos - v_at_target * dt - nonlinear_weight * 0.5 * a_at_target * (dt ** 2)
+                if use_nonlinear_for_this and a_at_target is not None:
+                    # 使用历史时刻的速度和加速度（非线性）
+                    pos = current_pos - v_at_target * dt - 0.5 * a_at_target * (dt ** 2)
                 else:
-                    # 完全线性（没有加速度或权重为0）
+                    # 只有速度，没有加速度，或加速度不显著（线性）
                     pos = current_pos - v_at_target * dt
             else:
                 # 没找到历史速度，降级到使用当前速度
@@ -510,10 +457,8 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                 smin = float(np.min(sims))
                 smean = float(np.mean(sims))
                 smax = float(np.max(sims))
-                print(f"[L2.5 Stats] pairs={pairs_total}, pass={int(mask.sum())}, decayed_sim(min/mean/max)={smin:.3f}/{smean:.3f}/{smax:.3f}")
             else:
-                print(f"[L2.5 Stats] pairs={pairs_total}, pass=0, decayed_sim(min/mean/max)=NA/NA/NA")
-
+                pass
         # 3) 线性分配（全局最优）
         assign = linear_assignment(C)
         if assign.size == 0:
@@ -537,10 +482,8 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
             dt_list = [dt for _, _, _, dt, _ in matched_pairs]
             from collections import Counter
             dt_dist = Counter(dt_list)
-            print(f"[L2.5 Δt分布] 总匹配={len(matched_pairs)}, 分布={dict(sorted(dt_dist.items()))}")
         
         return matched_pairs
-
     # 路径2：保留原贪心（回退）
     for track in unmatched_tracks:
         # 检查是否满足触发条件

@@ -1,11 +1,13 @@
 # -*-coding:utf-8-*
 # author: wangxy
 import numpy as np
+import math
 from tracking.cost_function import iou3d, convert_3dbox_to_8corner, iou_batch, eucliDistance
 import scipy.spatial as sp
 from tracking.cost_matrix_fusion import compute_fused_cost_matrix
 from copy import deepcopy
 from tracking.adaptive_angle_weight import compute_adaptive_cost_matrix_weights
+from tracking.angle_feature import compute_angle_similarity_matrix
 
 
 def split_cosine_dist(dets, trks, affinity_thresh=0.50, pair_diff_thresh=0.6, hard_thresh=True):
@@ -279,6 +281,99 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
         # 距离门控优先：在唯一匹配分支前先按距离阈值过滤候选
         if dist_thr_vec is not None and dist_thr_vec.size == iou_matrix.shape[1] and dist_matrix is not None:
             a = (a & (dist_matrix <= dist_thr_vec.reshape(1, -1))).astype(np.int32)
+        
+        # ========== 身份冲突校验（Soft Verification）==========
+        # 目的：利用角度作为"纠错器"而非"过滤器"
+        # 策略：角度差异过大时，将匹配降级到fused_cost路径重新竞争
+        enable_angle_conflict_check = False  # 默认关闭
+        if hasattr(angle_config, 'enable_angle_conflict_check'):
+            enable_angle_conflict_check = bool(angle_config.enable_angle_conflict_check)
+        
+        if enable_angle and enable_angle_conflict_check and angle_config is not None:
+            # 获取身份冲突阈值（默认45度）
+            conflict_angle_threshold = math.radians(45)
+            if hasattr(angle_config, 'conflict_angle_threshold'):
+                conflict_angle_threshold = float(angle_config.conflict_angle_threshold)
+            
+            # 角度归一化函数：将角度归一化到[-π, π]
+            def normalize_angle(angle):
+                """将角度归一化到[-π, π]范围"""
+                while angle > math.pi:
+                    angle -= 2 * math.pi
+                while angle < -math.pi:
+                    angle += 2 * math.pi
+                return angle
+            
+            # 对称性感知角度差计算
+            def compute_symmetric_angle_diff(angle1, angle2):
+                """
+                计算对称性感知的角度差
+                使用公式: Δθ_sym = arccos(|cos(Δθ)|)
+                效果: 0°和180°被视为相同（角度差=0°）
+                """
+                delta = normalize_angle(angle1 - angle2)
+                cos_delta = abs(math.cos(delta))
+                delta_sym = math.acos(np.clip(cos_delta, 0.0, 1.0))
+                return delta_sym
+            
+            # 提取角度
+            def _angle_from_track(trk):
+                try:
+                    if hasattr(trk, 'angle_smoothed') and trk.angle_smoothed is not None:
+                        return normalize_angle(float(trk.angle_smoothed))
+                    if hasattr(trk, 'pose') and trk.pose is not None and len(trk.pose) >= 7:
+                        return normalize_angle(float(trk.pose[3]))
+                except Exception:
+                    pass
+                return 0.0
+            
+            def _angle_from_det(det):
+                try:
+                    if hasattr(det, 'bbox') and det.bbox is not None and len(det.bbox) >= 7:
+                        return normalize_angle(float(det.bbox[3]))
+                except Exception:
+                    pass
+                return 0.0
+            
+            track_angles = np.array([_angle_from_track(t) for t in trackers], dtype=np.float32)
+            det_angles = np.array([_angle_from_det(d) for d in detections], dtype=np.float32)
+            
+            if track_angles.size > 0 and det_angles.size > 0:
+                # 计算对称角度差异矩阵
+                angle_diff_matrix = np.zeros((len(detections), len(trackers)), dtype=np.float32)
+                for d in range(len(detections)):
+                    for t in range(len(trackers)):
+                        # 使用对称性感知计算
+                        angle_diff_matrix[d, t] = compute_symmetric_angle_diff(
+                            det_angles[d], track_angles[t]
+                        )
+                
+                # 身份冲突检测：对称角度差异>阈值 → 标记为冲突（但不直接拒绝）
+                conflict_mask = (angle_diff_matrix > conflict_angle_threshold).astype(np.int32)
+                
+                # 统计冲突候选
+                n_conflicts = int((a & conflict_mask).sum())
+                
+                # ========== 详细诊断：分析冲突匹配 ==========
+                if verbose_flag and n_conflicts > 0:
+                    conflict_pairs = np.where(a & conflict_mask)
+                    print(f"\n[身份冲突校验] 检测到 {n_conflicts} 个潜在冲突", flush=True)
+                    print(f"{'Det':<4} {'Trk':<4} {'IoU':<6} {'对称角度差':<12} {'检测角度':<10} {'轨迹角度':<10} {'处理方式'}", flush=True)
+                    print("-" * 80, flush=True)
+                    
+                    for d, t in zip(conflict_pairs[0], conflict_pairs[1]):
+                        iou_val = iou_matrix[d, t]
+                        angle_diff_sym_deg = math.degrees(angle_diff_matrix[d, t])
+                        det_angle_deg = math.degrees(det_angles[d])
+                        trk_angle_deg = math.degrees(track_angles[t])
+                        
+                        print(f"{d:<4} {t:<4} {iou_val:<6.3f} {angle_diff_sym_deg:<12.1f} {det_angle_deg:<10.1f} {trk_angle_deg:<10.1f} 降级到fused_cost", flush=True)
+                    print("-" * 80 + "\n", flush=True)
+                
+                # 软校验：将冲突匹配降级到fused_cost路径（破坏unique条件）
+                # 这样它们会在fused_cost中与角度+外观+IoU重新竞争
+                a = (a & (~conflict_mask)).astype(np.int32)
+        
         if a.sum(1).max() == 1 and a.sum(0).max() == 1:
             matched_indices = np.stack(np.where(a), axis=1)
             if verbose_flag:
@@ -346,6 +441,12 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 if hasattr(angle_cfg_for_call, 'angle_cost_sigma'):
                     angle_cfg_for_call.angle_cost_sigma = 0.35
             residual = max(0.0, 1.0 - w_app)
+            
+            # ========== 路径感知的权重分配 ==========
+            # 核心思想：fused_cost路径说明IoU不可靠，需要大幅增加角度权重
+            # unique_iou路径（90%）：IoU可靠，不需要角度
+            # fused_cost路径（10%）：IoU不可靠，迫切需要角度辅助
+            
             # 从 Tracker.angle_level1_weight 传入的 angle_config.angle_weight 读取角度占比（0~1），默认0.25
             ang_share = 0.25
             try:
@@ -357,6 +458,27 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 ang_share = 0.0
             if ang_share > 1.0:
                 ang_share = 1.0
+            
+            # ✅ 路径感知增强：在fused_cost路径中，IoU不可靠，大幅增加角度权重
+            # 检查是否启用路径感知增强
+            enable_path_aware_weighting = True  # 默认启用
+            if hasattr(angle_cfg_for_call, 'enable_path_aware_weighting'):
+                enable_path_aware_weighting = bool(angle_cfg_for_call.enable_path_aware_weighting)
+            
+            if enable_path_aware_weighting:
+                # fused_cost路径说明IoU特征不够可靠（存在多个候选）
+                # 需要大幅增加角度权重来辅助区分
+                fused_cost_angle_boost = 1.8  # 增强系数（默认1.8倍）
+                if hasattr(angle_cfg_for_call, 'fused_cost_angle_boost'):
+                    fused_cost_angle_boost = float(angle_cfg_for_call.fused_cost_angle_boost)
+                
+                ang_share_boosted = min(ang_share * fused_cost_angle_boost, 0.95)  # 最高95%
+                
+                if verbose_flag:
+                    print(f"[路径感知] fused_cost路径，角度权重增强: {ang_share:.3f} → {ang_share_boosted:.3f} (x{fused_cost_angle_boost:.1f})", flush=True)
+                
+                ang_share = ang_share_boosted
+            
             w_ang = residual * ang_share
             w_iou = residual - w_ang
             if verbose_flag:
@@ -376,9 +498,35 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
             # Only applied when angle feature is enabled
             angle_weight_matrix = None
             if enable_angle:
+                # ========== 角度质量评估 ==========
+                from tracking.angle_quality import compute_angle_quality_matrix
+                
+                # 计算质量矩阵 [n_dets, n_tracks]
+                quality_matrix = compute_angle_quality_matrix(detections, trackers)
+                
+                # ========== 调试：统计质量分布 ==========
+                if verbose_flag:
+                    n_total = quality_matrix.size
+                    n_low_quality = (quality_matrix < 0.5).sum()
+                    n_zero_quality = (quality_matrix == 0.0).sum()
+                    avg_quality = quality_matrix.mean() if n_total > 0 else 0.0
+                    print(f"[角度质量] 总对数={n_total}, 低质量(<0.5)={n_low_quality} ({n_low_quality/n_total*100:.1f}%), "
+                          f"零质量(=0.0)={n_zero_quality} ({n_zero_quality/n_total*100:.1f}%), 平均质量={avg_quality:.3f}", flush=True)
+                    
+                    # ========== 调试：检查权重矩阵 ==========
+                    if hasattr(locals(), 'angle_weight_matrix') and angle_weight_matrix is not None:
+                        print(f"[权重调试] angle_weight_matrix形状={angle_weight_matrix.shape}, "
+                              f"最小值={angle_weight_matrix.min():.3f}, 最大值={angle_weight_matrix.max():.3f}, "
+                              f"平均值={angle_weight_matrix.mean():.3f}", flush=True)
+                
                 # Build angle arrays for trackers/detections
                 def _angle_from_track(trk):
                     try:
+                        # 优先使用平滑角度（EMA）
+                        if hasattr(trk, 'angle_smoothed') and trk.angle_smoothed is not None:
+                            return float(trk.angle_smoothed)
+                        
+                        # 否则使用原始角度
                         # 轨迹pose格式: [x, y, z, rot_y, l, w, h]
                         if hasattr(trk, 'pose') and trk.pose is not None and len(trk.pose) >= 7:
                             return float(trk.pose[3])
@@ -418,14 +566,38 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 if track_angles.size > 0 and det_angles.size > 0:
                     # Use gaussian method to produce unit angle weights in [0,1]
                     base_w = {'iou': 0.0, 'velocity': 0.0, 'appearance': 0.0, 'angle': 1.0}
+                    
+                    # 从angle_config中获取sigma值
+                    angle_sigma = None
+                    if angle_cfg_for_call is not None and hasattr(angle_cfg_for_call, 'angle_cost_sigma'):
+                        angle_sigma = float(angle_cfg_for_call.angle_cost_sigma)
+                    
                     adaptive_w = compute_adaptive_cost_matrix_weights(
                         track_angles, det_angles,
                         base_weights=base_w,
                         angle_weight_method='gaussian',
+                        angle_sigma=angle_sigma,
                         verbose=False
                     )
-                    # Scale by base scalar w_ang to get final per-pair angle weights
-                    angle_weight_matrix = w_ang * adaptive_w['angle']  # shape: (trks, dets)
+                    # ========== 应用质量控制 ==========
+                    # 质量矩阵: [n_dets, n_tracks]
+                    # adaptive_w['angle']: [n_tracks, n_dets]
+                    # 需要转置质量矩阵以匹配维度
+                    quality_matrix_T = quality_matrix.T  # [n_tracks, n_dets]
+                    
+                    # 低质量检测 → 角度权重设为0（完全不使用角度）
+                    # 高质量检测 → 使用完整的自适应角度权重
+                    angle_weight_matrix = w_ang * adaptive_w['angle'] * quality_matrix_T  # shape: (trks, dets)
+                    
+                    # ========== 调试：检查权重矩阵 ==========
+                    if verbose_flag:
+                        print(f"[权重调试] w_ang={w_ang:.3f}", flush=True)
+                        print(f"[权重调试] adaptive_w['angle']: min={adaptive_w['angle'].min():.3f}, "
+                              f"max={adaptive_w['angle'].max():.3f}, mean={adaptive_w['angle'].mean():.3f}", flush=True)
+                        print(f"[权重调试] quality_matrix_T: min={quality_matrix_T.min():.3f}, "
+                              f"max={quality_matrix_T.max():.3f}, mean={quality_matrix_T.mean():.3f}", flush=True)
+                        print(f"[权重调试] angle_weight_matrix: min={angle_weight_matrix.min():.3f}, "
+                              f"max={angle_weight_matrix.max():.3f}, mean={angle_weight_matrix.mean():.3f}", flush=True)
 
 
             fused_cost, angle_cost, gate_mask = compute_fused_cost_matrix(

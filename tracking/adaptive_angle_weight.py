@@ -13,7 +13,7 @@ import numpy as np
 import math
 
 
-def compute_adaptive_angle_weight(angle_diff, method='sigmoid'):
+def compute_adaptive_angle_weight(angle_diff, method='sigmoid', sigma=None):
     """
     根据角度差异计算自适应权重
     
@@ -23,6 +23,7 @@ def compute_adaptive_angle_weight(angle_diff, method='sigmoid'):
                 - 'sigmoid': 使用sigmoid函数 (平滑过渡)
                 - 'linear': 使用分段线性函数 (快速衰减)
                 - 'gaussian': 使用高斯函数 (钟形分布)
+        sigma: 高斯方法的标准差 (弧度)，默认为π/6 (30度)
     
     Returns:
         weight: 权重值 [0, 1]
@@ -59,8 +60,9 @@ def compute_adaptive_angle_weight(angle_diff, method='sigmoid'):
     elif method == 'gaussian':
         # 高斯方法: 以0为中心的高斯分布
         # w(θ) = exp(-θ² / (2σ²))
-        # σ = π/6 (30度标准差)
-        sigma = math.pi / 6
+        # 使用传入的sigma，如果未提供则默认为π/6 (30度)
+        if sigma is None:
+            sigma = math.pi / 6  # 默认30度
         weight = np.exp(-(abs_diff ** 2) / (2 * sigma ** 2))
         return float(weight)
     
@@ -71,6 +73,7 @@ def compute_adaptive_angle_weight(angle_diff, method='sigmoid'):
 def compute_adaptive_cost_matrix_weights(track_angles, det_angles, 
                                          base_weights=None, 
                                          angle_weight_method='sigmoid',
+                                         angle_sigma=None,
                                          verbose=False):
     """
     计算自适应的代价矩阵权重
@@ -84,6 +87,7 @@ def compute_adaptive_cost_matrix_weights(track_angles, det_angles,
         base_weights: 基础权重字典
                      {'iou': 0.4, 'velocity': 0.3, 'appearance': 0.15, 'angle': 0.15}
         angle_weight_method: 角度权重计算方法
+        angle_sigma: 高斯方法的标准差 (弧度)
         verbose: 是否打印调试信息
     
     Returns:
@@ -130,7 +134,8 @@ def compute_adaptive_cost_matrix_weights(track_angles, det_angles,
             # 计算自适应角度权重
             adaptive_angle_weight = compute_adaptive_angle_weight(
                 angle_diff, 
-                method=angle_weight_method
+                method=angle_weight_method,
+                sigma=angle_sigma
             )
             
             # 调整权重: 角度权重降低时, 其他权重相应提高
