@@ -12,7 +12,6 @@ from tracking.kalman_fileter_3d import  KalmanBoxTracker
 from tracking.track_3d import Track_3D, TrackState
 from trackers.ocsort_embedding.embedding import EmbeddingComputer
 from tracking.matching import compute_aw_new_metric
-from tracking.angle_feature import AngleFeatureConfig, compute_angle_similarity_matrix, wrap_to_pi
 from tracking.multi_frame_backtrack import (MultiFrameBacktrackConfig, 
                                            multi_frame_backtrack_association,
                                            process_multi_frame_matches)
@@ -77,24 +76,14 @@ class Tracker:
         self.multi_frame_config.use_nonlinear_backtrack = False  # 基础开关保持关闭
         self.multi_frame_config.use_acceleration_gate = False   # ❌ 基线：关闭加速度门控
         self.multi_frame_config.acceleration_threshold = 1.5   # 加速度阈值 (m/s²)
-        self.enable_angle_in_level1 = False        # ❌ 基线：关闭角度特征
-        self.enable_angle_gate_in_backtrack = False
-        self.angle_level1_weight = 0.45
-        self.angle_level1_method = 'gaussian'
-        self.angle_level1_sigma = 0.25
-        self.angle_level1_gate_threshold = math.radians(52)
-        self.angle_backtrack_method = 'gaussian'
-        self.angle_backtrack_sigma = 0.30
-        self.angle_backtrack_gate_threshold = math.radians(60)
-        self.angle_config = AngleFeatureConfig()
-        self.angle_config.enable_angle_feature = self.enable_angle_in_level1
-        self.angle_config.angle_cost_method = self.angle_level1_method
-        self.angle_config.angle_cost_sigma = self.angle_level1_sigma
-        self.angle_config.enable_angle_gate = True   # 启用角度门控（创新开启）
-        self.angle_config.angle_gate_threshold = self.angle_level1_gate_threshold
-        self.angle_config.angle_weight = self.angle_level1_weight
-        self.angle_config.verbose = False
-        self.backtrack_angle_gate_verbose = True
+        self.heading_ambiguity_rescore_enabled = False
+        self.heading_distance_metric = 'symmetric'
+        self.heading_ambiguity_margin = 0.08
+        self.heading_ambiguity_weight = 0.20
+        self.heading_pre_gate_enabled = True
+        self.heading_pre_gate_threshold = 0.55
+        self.heading_hard_gate_threshold = 0.45
+        self.heading_stats = {}
         self.last_t_L1 = 0.0
         self.last_t_L15 = 0.0
         self.last_t_L2 = 0.0
@@ -131,6 +120,27 @@ class Tracker:
         for track in self.tracks_2d:
             # print(track)
             track.predict_2d(self.kf_2d)
+
+    def _get_heading_options(self):
+        return {
+            'enabled': self.heading_ambiguity_rescore_enabled,
+            'metric': self.heading_distance_metric,
+            'ambiguity_margin': self.heading_ambiguity_margin,
+            'weight': self.heading_ambiguity_weight,
+            'pre_gate_enabled': self.heading_pre_gate_enabled,
+            'pre_gate_threshold': self.heading_pre_gate_threshold,
+            'hard_gate_threshold': self.heading_hard_gate_threshold,
+            'stats': self.heading_stats,
+        }
+
+    def reset_heading_stats(self):
+        self.heading_stats = {
+            'calls': 0,
+            'changed_calls': 0,
+            'changed_pairs': 0,
+            'pre_gate_suppressed_pairs': 0,
+            'pre_gate_changed_matches': 0,
+        }
 
     @property
     def t_L1(self):
@@ -264,62 +274,12 @@ class Tracker:
         # 1st Level of Association
         t0 = time.time()
         iou_shreshold=0.01
-        # 保持权重接线：每帧将配置中的角度权重更新为 Tracker.angle_level1_weight
-        try:
-            self.angle_config.angle_weight = float(self.angle_level1_weight)
-        except Exception:
-            pass
         matched_fusion_idx, unmatched_dets_fusion_idx, unmatched_trks_fusion_idx = associate_detections_to_trackers_fusion(
             detection_3D_fusion, self.tracks_3d, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
-            det_embs=dets_3D_fusion_embs, det_app=False, angle_config=self.angle_config,
-            enable_angle=self.enable_angle_in_level1, appearance_weight=self.appearance_weight_level1)
-        
-        # ========== 统计角度质量控制效果 ==========
-        angle_quality_stats = {'low_quality': 0, 'high_quality': 0, 'total': 0}
+            det_embs=dets_3D_fusion_embs, det_app=False, appearance_weight=self.appearance_weight_level1,
+            heading_options=self._get_heading_options())
         
         for detection_idx, track_idx in matched_fusion_idx:
-            # ========== 角度平滑（EMA）- 两阶段质量控制 ==========
-            # 参照外观特征的两阶段方案：关联时控制权重 + 关联后控制更新
-            detection = detection_3D_fusion[detection_idx]
-            track = self.tracks_3d[track_idx]
-            
-            if hasattr(detection, 'bbox') and detection.bbox is not None and len(detection.bbox) >= 7:
-                observed_angle = float(detection.bbox[3])  # 提取观测角度
-                
-                # ========== 阶段2：关联后的质量控制（类比外观特征）==========
-                # 外观特征逻辑：sc < 0.4 → alpha=0.99（几乎不更新）
-                # 航向角逻辑：quality < 0.5 → 不更新（保留历史）
-                from tracking.angle_quality import compute_angle_quality
-                
-                angle_quality = compute_angle_quality(detection, track)
-                angle_quality_stats['total'] += 1
-                
-                if angle_quality < 0.5:
-                    # 低质量 → 不更新角度（保留历史，类比外观的alpha=0.99）
-                    angle_quality_stats['low_quality'] += 1
-                    # 如果是首次初始化，仍然需要设置初值
-                    if not hasattr(track, 'angle_smoothed') or track.angle_smoothed is None:
-                        track.angle_smoothed = observed_angle
-                    # 否则保持不变（不更新）
-                else:
-                    # 高质量 → 自适应EMA更新
-                    angle_quality_stats['high_quality'] += 1
-                    # 速度自适应EMA系数
-                    alpha = self._get_angle_ema_alpha(track)
-                    
-                    # 根据质量进一步调整alpha（类比外观的自适应alpha）
-                    # 质量越高，更新步长越大
-                    alpha_adjusted = alpha * angle_quality
-                    
-                    if not hasattr(track, 'angle_smoothed') or track.angle_smoothed is None:
-                        # 首次初始化
-                        track.angle_smoothed = observed_angle
-                    else:
-                        # EMA平滑（处理角度的循环性）
-                        delta = wrap_to_pi(observed_angle - track.angle_smoothed)
-                        track.angle_smoothed = wrap_to_pi(track.angle_smoothed + alpha_adjusted * delta)
-            
-            # 更新轨迹状态
             self.tracks_3d[track_idx].update_3d(detection_3D_fusion[detection_idx], current_frame=self.current_frame)
             if use_app_L1 and dets_3D_fusion_embs.shape[0] > detection_idx:
                 # 软更新策略：低分数采用极小步长
@@ -370,32 +330,6 @@ class Tracker:
                 original_det_idx = unmatched_dets_fusion_idx[det_idx]
                 original_trk_idx = unmatched_trks_fusion_idx[trk_idx]
                 
-                # ========== 角度平滑（L1.5关联）- 两阶段质量控制 ==========
-                detection_l15 = detection_3D_fusion[original_det_idx]
-                track_l15 = self.tracks_3d[original_trk_idx]
-                
-                if hasattr(detection_l15, 'bbox') and detection_l15.bbox is not None and len(detection_l15.bbox) >= 7:
-                    from tracking.angle_quality import compute_angle_quality
-                    
-                    observed_angle_l15 = float(detection_l15.bbox[3])
-                    angle_quality_l15 = compute_angle_quality(detection_l15, track_l15)
-                    
-                    if angle_quality_l15 < 0.5:
-                        # 低质量 → 不更新角度
-                        if not hasattr(track_l15, 'angle_smoothed') or track_l15.angle_smoothed is None:
-                            track_l15.angle_smoothed = observed_angle_l15
-                    else:
-                        # 高质量 → 自适应EMA更新
-                        alpha_l15 = self._get_angle_ema_alpha(track_l15)
-                        alpha_adjusted_l15 = alpha_l15 * angle_quality_l15
-                        
-                        if not hasattr(track_l15, 'angle_smoothed') or track_l15.angle_smoothed is None:
-                            track_l15.angle_smoothed = observed_angle_l15
-                        else:
-                            delta_l15 = wrap_to_pi(observed_angle_l15 - track_l15.angle_smoothed)
-                            track_l15.angle_smoothed = wrap_to_pi(track_l15.angle_smoothed + alpha_adjusted_l15 * delta_l15)
-                
-                # 更新轨迹状态
                 self.tracks_3d[original_trk_idx].update_3d(
                     detection_3D_fusion[original_det_idx],
                     current_frame=self.current_frame
@@ -439,53 +373,14 @@ class Tracker:
         self.unmatch_tracks_3d1 = [t for t in self.tracks_3d if t.time_since_update > 0]
         t2 = time.time()
         iou_shreshold=0.01
-        try:
-            self.angle_config.angle_weight = 0.45
-            self.angle_config.gamma_min = 0.30
-            self.angle_config.penalty_enable = True
-            self.angle_config.penalty_threshold_rad = math.radians(60)
-            self.angle_config.penalty_factor = 1.3
-            self.angle_config.penalty_iou_floor = 0.005
-            self.angle_config.rescue_enable = True
-            self.angle_config.rescue_angle_thr_rad = math.radians(25)
-            self.angle_config.rescue_app_thr = 0.55
-            self.angle_config.rescue_iou_floor = 0.005
-            self.angle_config.rescue_dist_relax = False
-            self.angle_config.rescue_dist_relax_ratio = 1.0
-            self.angle_config.verbose = False
-        except Exception:
-            pass
         matched_only_idx, unmatched_dets_only_idx, _ = associate_detections_to_trackers_fusion(
             detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
-            det_embs=dets_3D_only_embs, det_app=self.app_off, angle_config=self.angle_config, enable_angle=self.enable_angle_in_level1, appearance_weight=self.appearance_weight_level1)
+            det_embs=dets_3D_only_embs, det_app=self.app_off, appearance_weight=self.appearance_weight_level1,
+            heading_options=self._get_heading_options())
         index_to_delete = []
         for detection_idx, track_idx in matched_only_idx:
             for index, t in enumerate(self.tracks_3d):
                 if t.track_id_3d == self.unmatch_tracks_3d1[track_idx].track_id_3d:
-                    # ========== 角度平滑（L2关联）- 两阶段质量控制 ==========
-                    detection_l2 = detection_3D_only[detection_idx]
-                    if hasattr(detection_l2, 'bbox') and detection_l2.bbox is not None and len(detection_l2.bbox) >= 7:
-                        from tracking.angle_quality import compute_angle_quality
-                        
-                        observed_angle_l2 = float(detection_l2.bbox[3])
-                        angle_quality_l2 = compute_angle_quality(detection_l2, t)
-                        
-                        if angle_quality_l2 < 0.5:
-                            # 低质量 → 不更新角度
-                            if not hasattr(t, 'angle_smoothed') or t.angle_smoothed is None:
-                                t.angle_smoothed = observed_angle_l2
-                        else:
-                            # 高质量 → 自适应EMA更新
-                            alpha_l2 = self._get_angle_ema_alpha(t)
-                            alpha_adjusted_l2 = alpha_l2 * angle_quality_l2
-                            
-                            if not hasattr(t, 'angle_smoothed') or t.angle_smoothed is None:
-                                t.angle_smoothed = observed_angle_l2
-                            else:
-                                delta_l2 = wrap_to_pi(observed_angle_l2 - t.angle_smoothed)
-                                t.angle_smoothed = wrap_to_pi(t.angle_smoothed + alpha_adjusted_l2 * delta_l2)
-                    
-                    # 更新轨迹状态
                     t.update_3d(detection_3D_only[detection_idx], current_frame=self.current_frame)
                     if not self.app_off:
                         # 软更新策略：低分数采用极小步长（若无score则按固定alpha）
@@ -776,24 +671,6 @@ class Tracker:
                     w_pos_t * position_matrix[d, t]
                 )
         
-        if self.enable_angle_gate_in_backtrack:
-            track_angles = np.array([trk.pose[6] if (hasattr(trk, 'pose') and trk.pose is not None and len(trk.pose) >= 7) else 0.0 for trk in tracks])
-            det_angles = np.array([det.bbox[6] if (hasattr(det, 'bbox') and det.bbox is not None and len(det.bbox) >= 7) else 0.0 for det in detections])
-            _, gate_mask = compute_angle_similarity_matrix(
-                track_angles,
-                det_angles,
-                method=self.angle_backtrack_method,
-                sigma=self.angle_backtrack_sigma,
-                gate_threshold=self.angle_backtrack_gate_threshold
-            )
-            gate_mask_T = gate_mask.T
-            if getattr(self, 'backtrack_angle_gate_verbose', False):
-                n_total_pairs = int(gate_mask.size)
-                n_rejected = int((~gate_mask).sum())
-                ratio = (n_rejected / n_total_pairs * 100.0) if n_total_pairs > 0 else 0.0
-                print(f"[回溯角度门控] 拒绝 {n_rejected}/{n_total_pairs} 对 ({ratio:.2f}%)")
-            combined_matrix[~gate_mask_T] = -1e9
-        
         # 4. 匈牙利算法求解
         cost_matrix = -combined_matrix
         matched_indices = linear_assignment(cost_matrix)
@@ -840,11 +717,8 @@ class Tracker:
         # 归一化速度到[0, 1]
         v_norm = speed / self.velocity_weight_vmax
         
-        # 从angle_config读取gamma_min，如果没有则使用默认值0.20
         gamma_min = 0.20
-        if hasattr(self, 'angle_config') and hasattr(self.angle_config, 'gamma_min'):
-            gamma_min = float(self.angle_config.gamma_min)
-        
+
         # 速度自适应权重抑制策略 γ(v)
         # γ(v) = max(γ_min, ((v - v_low) / (v_high - v_low))^p)
         if v_norm < self.adaptive_threshold_low:
@@ -860,33 +734,6 @@ class Tracker:
             p = 2.0  # 指数参数（凸曲线）
             gamma = gamma_min + (1.0 - gamma_min) * (ratio ** p)  # 从gamma_min到1.0的指数增长
             return gamma
-    
-    def _get_angle_ema_alpha(self, track):
-        """
-        根据速度自适应调整EMA平滑系数
-        
-        Args:
-            track: 轨迹对象
-        
-        Returns:
-            alpha: EMA平滑系数 [0.3, 0.7]
-                  - 高速(>8 m/s): 0.7 (快速响应，角度稳定)
-                  - 中速(5-8 m/s): 0.5 (平衡)
-                  - 低速(<5 m/s): 0.3 (强平滑，减少噪声)
-        """
-        try:
-            velocity = get_velocity(track)
-            speed = np.linalg.norm(velocity)
-            
-            if speed > 8.0:  # 高速 (>28.8 km/h)
-                return 0.7  # 快速响应
-            elif speed < 5.0:  # 低速 (<18 km/h)
-                return 0.3  # 强平滑（回到原来的0.3）
-            else:  # 中速 (5-8 m/s)
-                # 线性插值：从0.3到0.7
-                return 0.3 + (speed - 5.0) / 3.0 * 0.4
-        except Exception:
-            return 0.5  # 默认值
     
     def _update_detection_history(self, detections):
         """

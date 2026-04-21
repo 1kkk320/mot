@@ -167,36 +167,22 @@ def main():
     total_time, total_frames, i = 0.0, 0, 0  # Tracker runtime, total frames and Serial number of the dataset、跟踪器运行时，总时间、总帧数和数据集的序列号
     tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)
     
-    # ========== 实验9配置：全部创新点启用 ==========
-    
-    # ========== 创新点1: 角度特征（路径感知权重增强） ==========
-    tracker.tracker.enable_angle_in_level1 = True  # ✅ 启用角度特征
-    tracker.tracker.angle_config.enable_angle_feature = True  # ✅ 启用角度特征
-    
-    # 基础角度配置
-    tracker.tracker.angle_config.angle_cost_method = 'symmetric'  # 对称性方法
-    tracker.tracker.angle_config.angle_cost_sigma = 0.45  # 0.45 (25.8°)
-    tracker.tracker.angle_config.angle_weight = 0.50  # 基础权重0.50
-    tracker.tracker.angle_config.angle_gate_threshold = math.radians(52)  # 52°
-    tracker.tracker.angle_config.gamma_min = 0.20  # 0.20
-    
-    # ✅ 启用路径感知权重增强
-    tracker.tracker.angle_config.enable_path_aware_weighting = True  # 启用
-    tracker.tracker.angle_config.fused_cost_angle_boost = 1.8  # 增强1.8倍
-    # 效果：fused_cost路径中，角度权重从0.50增强到0.90
-    
-    # ❌ 禁用身份冲突校验（实验8失败）
-    tracker.tracker.angle_config.enable_angle_conflict_check = False  # 禁用
-    
     # 保持外观权重
-    tracker.tracker.appearance_weight_level1 = 0.10  # 0.10
-    
+    tracker.tracker.appearance_weight_level1 = 0.10
+
+    # ========== 航向角创新点：前置航向冲突剔除 ==========
+    tracker.tracker.heading_ambiguity_rescore_enabled = False
+    tracker.tracker.heading_distance_metric = 'symmetric'
+    tracker.tracker.heading_pre_gate_enabled = True
+    tracker.tracker.heading_pre_gate_threshold = 0.55
+    print('[Heading Config] pre_gate_only=True threshold={:.2f}'.format(
+        tracker.tracker.heading_pre_gate_threshold,
+    ))
+
     # 优化速度自适应参数
     tracker.tracker.adaptive_threshold_low = 0.40  # 0.40
     tracker.tracker.adaptive_threshold_high = 0.70  # 0.70
-    
-    tracker.tracker.angle_config.verbose = False  # 关闭调试输出
-    
+
     # ========== 创新点2: L1.5速度回溯 ==========
     tracker.tracker.velocity_backtrack_enabled = True  # ✅ 启用L1.5速度回溯
     tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
@@ -226,12 +212,12 @@ def main():
     
     # ========== 其他配置 ==========
     tracker.tracker.embedding_off = False  # 保持外观特征提取
-    tracker.tracker.enable_angle_gate_in_backtrack = False  # L1.5中不使用角度门控
     
     # Iterate through each data set 遍历数据集
     for seq_file_3D in detection_file_list_3D:
         seq_filename_txt, seq_id, _ = fileparts(seq_file_3D)
         print('--------------Start processing the {} dataset--------------'.format(seq_id))
+        tracker.tracker.reset_heading_stats()
         total_image = 0  # Record the total frames in this dataset记录此数据集的总帧数
         # Find matching 2D detection file by sequence id
         seq_file_2D = None
@@ -364,6 +350,18 @@ def main():
                         # print(image_save_path)
 
         i += 1
+        heading_stats = tracker.tracker.heading_stats
+        print('[Heading Stats][{}] calls={} changed_calls={} changed_pairs={}'.format(
+            seq_id,
+            heading_stats.get('calls', 0),
+            heading_stats.get('changed_calls', 0),
+            heading_stats.get('changed_pairs', 0),
+        ))
+        print('[Heading PreGate][{}] suppressed_pairs={} changed_matches={}'.format(
+            seq_id,
+            heading_stats.get('pre_gate_suppressed_pairs', 0),
+            heading_stats.get('pre_gate_changed_matches', 0),
+        ))
         print('--------------The time it takes to process all datasets are {}s --------------'.format(total_time))
     
     # 输出 L1.5 和 L2.5 恢复统计
