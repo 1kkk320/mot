@@ -1,22 +1,4 @@
-import math
 import numpy as np
-
-
-def _wrap_to_pi(angle):
-    return math.atan2(math.sin(angle), math.cos(angle))
-
-
-def _circular_mean(angles, weights):
-    if len(angles) == 0:
-        return 0.0
-    s = 0.0
-    c = 0.0
-    for ang, w in zip(angles, weights):
-        s += float(w) * math.sin(float(ang))
-        c += float(w) * math.cos(float(ang))
-    if abs(s) < 1e-8 and abs(c) < 1e-8:
-        return float(angles[0])
-    return math.atan2(s, c)
 
 '''
   3D track management
@@ -36,7 +18,7 @@ class TrackState3Dor2D:
 
 
 class Track_3D:
-    def __init__(self, pose, kf_3d, track_id_3d, n_init, max_age, additional_info, emb=None, feature=None, init_frame=0):
+    def __init__(self, pose, kf_3d, track_id_3d, n_init, max_age,additional_info,emb = None, feature=None, init_frame=None):
         self.pose = pose
         self.kf_3d = kf_3d
         self.track_id_3d = track_id_3d
@@ -54,31 +36,19 @@ class Track_3D:
         self.emb = emb
         self.beta_t = 1.0
         self.rho = 0.04
-        self.last_l25_recovery_frame = None
-        self.appearance_memory_bank = []
-        self.fused_heading = float(pose[3]) if pose is not None and len(pose) >= 4 else 0.0
-        self.heading_rate = 0.0
-        self.heading_obs_det = self.fused_heading
-        self.heading_obs_vel = self.fused_heading
-        self.heading_conf_det = 1.0
-        self.heading_conf_vel = 0.0
-        self.heading_last_frame = init_frame
-        self.heading_history = [(init_frame, self.fused_heading)]
+        self.init_frame = 0 if init_frame is None else int(init_frame)
+        self.last_update_frame = self.init_frame
         
         # ========== 方案3: 多帧回溯 - 速度历史 ==========
         self.velocity_history = []  # [(frame_id, velocity), ...]
-        self.max_history_length = 10  # 保留最近10帧（方法2需要更长历史）
+        self.max_history_length = 5  # 保留最近5帧
         
-        # 初始化第一帧速度（使用全局帧号）
+        # 初始化第一帧速度
         initial_velocity = self.kf_3d.kf.x[7:10].flatten()
-        self.velocity_history.append((init_frame, initial_velocity.copy()))
+        self.velocity_history.append((self.last_update_frame, initial_velocity.copy()))
 
     def predict_3d(self, trk_3d):
         self.pose = trk_3d.predict()
-        try:
-            self.pose[3] = self.get_predicted_heading(self.time_since_update + 1)
-        except Exception:
-            pass
 
     def update_3d(self, detection_3d, current_frame=None):
         low_score = False
@@ -95,6 +65,8 @@ class Track_3D:
         self.age += 1
         self.time_since_update = 0
         self.confidence = 1
+        if current_frame is not None:
+            self.last_update_frame = int(current_frame)
         if self.hits >= self.n_init:
             self.state = TrackState.Confirmed
         else:
@@ -104,14 +76,11 @@ class Track_3D:
         
         # ========== 方案3: 记录速度历史 ==========
         current_velocity = self.kf_3d.kf.x[7:10].flatten()
-        # 使用全局帧号（如果提供），否则使用 age
-        frame_id = current_frame if current_frame is not None else self.age
-        self.velocity_history.append((frame_id, current_velocity.copy()))
+        self.velocity_history.append((self.last_update_frame, current_velocity.copy()))
         
         # 保持历史长度
         if len(self.velocity_history) > self.max_history_length:
             self.velocity_history.pop(0)
-        self._update_fused_heading(detection_3d, current_velocity, frame_id)
         self.reset_rassa()
 
     def update_emb(self, emb, alpha=0.8):
@@ -121,20 +90,6 @@ class Track_3D:
         这样做可以使嵌入向量更容易用于相似性比较，因为它们在尺度上是一致的。
         '''
         self.emb /= np.linalg.norm(self.emb)
-
-    def add_memory_feature(self, emb, max_size=3):
-        if emb is None:
-            return
-        try:
-            feat = np.asarray(emb, dtype=np.float32).reshape(-1)
-            if feat.size <= 1:
-                return
-            feat = feat / (np.linalg.norm(feat) + 1e-6)
-            self.appearance_memory_bank.append(feat.copy())
-            if len(self.appearance_memory_bank) > max(1, int(max_size)):
-                self.appearance_memory_bank = self.appearance_memory_bank[-int(max_size):]
-        except Exception:
-            return
 
     def state_update(self):
         if self.hits >= self.n_init:
@@ -177,75 +132,6 @@ class Track_3D:
 
     def get_emb(self):
         return self.emb
-
-    def get_predicted_heading(self, dt=1.0):
-        dt = max(float(dt), 0.0)
-        return _wrap_to_pi(float(self.fused_heading) + dt * float(self.heading_rate))
-
-    def _update_fused_heading(self, detection_3d, current_velocity, frame_id):
-        dt = max(float(frame_id - self.heading_last_frame), 1.0)
-        predicted_heading = self.get_predicted_heading(dt)
-
-        det_heading = predicted_heading
-        try:
-            det_heading = float(detection_3d.bbox[3])
-        except Exception:
-            pass
-
-        vel_heading = predicted_heading
-        try:
-            vx = float(current_velocity[0])
-            vz = float(current_velocity[2])
-            vel_heading = math.atan2(vz, vx + 1e-6)
-        except Exception:
-            pass
-
-        speed = 0.0
-        try:
-            speed = float(np.linalg.norm(np.asarray(current_velocity, dtype=np.float32)[[0, 2]]))
-        except Exception:
-            speed = 0.0
-
-        det_residual = _wrap_to_pi(det_heading - predicted_heading)
-        vel_residual = _wrap_to_pi(vel_heading - predicted_heading)
-
-        speed_scale = 3.0
-        det_scale = 0.6
-        vel_scale = 0.45
-
-        speed_reliability = 1.0 - math.exp(-speed / speed_scale)
-        det_reliability = math.exp(-0.5 * (det_residual / det_scale) ** 2)
-        vel_reliability = speed_reliability * math.exp(-0.5 * (vel_residual / vel_scale) ** 2)
-        pred_reliability = 0.35 + 0.25 * math.exp(-0.5 * ((det_residual - vel_residual) / 0.8) ** 2)
-
-        total = pred_reliability + det_reliability + vel_reliability + 1e-6
-        weights = [
-            pred_reliability / total,
-            det_reliability / total,
-            vel_reliability / total,
-        ]
-        fused_heading_new = _circular_mean(
-            [predicted_heading, det_heading, vel_heading],
-            weights,
-        )
-
-        heading_delta = _wrap_to_pi(fused_heading_new - float(self.fused_heading))
-        new_rate = heading_delta / dt
-        rate_blend = 0.5 + 0.4 * speed_reliability
-        self.heading_rate = float(rate_blend * new_rate + (1.0 - rate_blend) * float(self.heading_rate))
-        self.fused_heading = float(fused_heading_new)
-        self.heading_obs_det = float(det_heading)
-        self.heading_obs_vel = float(vel_heading)
-        self.heading_conf_det = float(det_reliability / total)
-        self.heading_conf_vel = float(vel_reliability / total)
-        self.heading_last_frame = int(frame_id)
-        self.heading_history.append((int(frame_id), float(self.fused_heading)))
-        if len(self.heading_history) > self.max_history_length:
-            self.heading_history.pop(0)
-        try:
-            self.pose[3] = self.fused_heading
-        except Exception:
-            pass
     
     # ========== 方案3: 多帧回溯 - 新增方法 ==========
     

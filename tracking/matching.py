@@ -12,6 +12,11 @@ def wrap_to_pi(angle):
 
 def extract_track_heading(track):
     try:
+        if hasattr(track, 'fused_heading'):
+            return float(track.fused_heading)
+    except Exception:
+        pass
+    try:
         if hasattr(track, 'pose') and track.pose is not None and len(track.pose) >= 4:
             return float(track.pose[3])
     except Exception:
@@ -26,6 +31,48 @@ def extract_detection_heading(detection):
     except Exception:
         pass
     return None
+
+
+def compute_heading_consistency(track_heading, det_heading, sigma=0.45):
+    if track_heading is None or det_heading is None:
+        return 0.5
+    delta = wrap_to_pi(track_heading - det_heading)
+    sigma = max(float(sigma), 1e-3)
+    return float(math.exp(-0.5 * (delta / sigma) ** 2))
+
+
+def compute_rotated_ground_similarity(det_box, trk_box, det_corners=None, trk_corners=None):
+    """
+    Continuous ground-plane geometric similarity using the existing 3D boxes.
+    This is a lightweight MCTrack-style replacement for plain 3D IoU scoring:
+    it jointly reflects rotated BEV overlap, center alignment and size consistency.
+    """
+    try:
+        if det_corners is None:
+            det_corners = convert_3dbox_to_8corner(det_box)
+        if trk_corners is None:
+            trk_corners = convert_3dbox_to_8corner(trk_box)
+        _, bev_iou = iou3d(det_corners, trk_corners)
+        bev_iou = float(np.clip(bev_iou, 0.0, 1.0))
+
+        det_box = np.asarray(det_box, dtype=np.float32)
+        trk_box = np.asarray(trk_box, dtype=np.float32)
+
+        center_dist = float(np.linalg.norm(det_box[[0, 2]] - trk_box[[0, 2]]))
+        det_diag = float(np.hypot(max(det_box[4], 1e-3), max(det_box[5], 1e-3)))
+        trk_diag = float(np.hypot(max(trk_box[4], 1e-3), max(trk_box[5], 1e-3)))
+        scale_ref = max(0.5 * (det_diag + trk_diag), 1e-3)
+        center_sim = float(np.exp(-center_dist / scale_ref))
+
+        size_delta = 0.5 * (
+            abs(math.log(max(float(det_box[4]), 1e-3) / max(float(trk_box[4]), 1e-3))) +
+            abs(math.log(max(float(det_box[5]), 1e-3) / max(float(trk_box[5]), 1e-3)))
+        )
+        size_sim = float(np.exp(-size_delta))
+
+        return float((bev_iou + center_sim + size_sim) / 3.0)
+    except Exception:
+        return 0.0
 
 
 def compute_heading_distance(track_heading, det_heading, metric='symmetric'):
@@ -285,6 +332,7 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
     heading_options = heading_options or {}
     heading_rescore_enabled = bool(heading_options.get('enabled', False))
     heading_enabled = heading_rescore_enabled or bool(heading_options.get('pre_gate_enabled', False))
+    state_heading_enabled = bool(heading_options.get('use_state_heading', False))
     heading_metric = heading_options.get('metric', 'symmetric')
     heading_weight = float(heading_options.get('weight', 0.20))
     heading_margin = float(heading_options.get('ambiguity_margin', 0.03))
@@ -292,6 +340,8 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
     heading_pre_gate_threshold = float(heading_options.get('pre_gate_threshold', 0.55))
     heading_hard_gate_threshold = float(heading_options.get('hard_gate_threshold', 0.45))
     heading_stats = heading_options.get('stats')
+    state_heading_sigma = float(heading_options.get('state_heading_sigma', 0.45))
+    rotated_geom_enabled = bool(heading_options.get('use_rotated_geom', False))
 
     if heading_enabled:
         _update_heading_stats(heading_stats, calls=1)
@@ -326,6 +376,21 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
             matched_indices = np.stack(np.where(candidate_mask), axis=1)
         else:
             score_matrix = iou_matrix.copy()
+            if rotated_geom_enabled and len(detections) > 0 and len(trackers) > 0:
+                rotated_geom_matrix = np.zeros_like(score_matrix, dtype=np.float32)
+                for d_idx, det in enumerate(detections):
+                    det_box = getattr(det, 'bbox', None)
+                    det_corners = dets_8corner[d_idx]
+                    for t_idx, trk in enumerate(trackers):
+                        trk_box = getattr(trk, 'pose', None)
+                        trk_corners = trks_8corner[t_idx]
+                        rotated_geom_matrix[d_idx, t_idx] = compute_rotated_ground_similarity(
+                            det_box,
+                            trk_box,
+                            det_corners=det_corners,
+                            trk_corners=trk_corners,
+                        )
+                score_matrix = rotated_geom_matrix
             if not det_app and emb_cost is not None and emb_cost.size > 0:
                 if not aw_off:
                     w_matrix = compute_aw_new_metric(emb_cost, w_assoc_emb, aw_param)
@@ -334,6 +399,25 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                     emb_cost = emb_cost * w_assoc_emb
                 w_app = min(max(appearance_weight if appearance_weight is not None else 0.10, 0.0), 0.15)
                 score_matrix = (1.0 - w_app) * score_matrix + w_app * emb_cost
+
+            if state_heading_enabled and len(detections) > 0 and len(trackers) > 0:
+                heading_consistency = np.full_like(score_matrix, 0.5, dtype=np.float32)
+                track_reliability = np.ones((len(trackers),), dtype=np.float32) * 0.5
+                for t_idx, trk in enumerate(trackers):
+                    det_conf = float(getattr(trk, 'heading_conf_det', 0.5))
+                    vel_conf = float(getattr(trk, 'heading_conf_vel', 0.5))
+                    track_reliability[t_idx] = np.clip(0.5 * (det_conf + vel_conf), 0.0, 1.0)
+                for d_idx, det in enumerate(detections):
+                    det_heading = extract_detection_heading(det)
+                    for t_idx, trk in enumerate(trackers):
+                        trk_heading = extract_track_heading(trk)
+                        heading_consistency[d_idx, t_idx] = compute_heading_consistency(
+                            trk_heading,
+                            det_heading,
+                            sigma=state_heading_sigma,
+                        )
+                blend = np.clip(0.15 * track_reliability.reshape(1, -1), 0.0, 0.15)
+                score_matrix = (1.0 - blend) * score_matrix + blend * heading_consistency
 
             baseline_score_matrix = score_matrix.copy()
             baseline_gated_score_matrix = baseline_score_matrix.copy()

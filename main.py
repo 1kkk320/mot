@@ -129,20 +129,6 @@ def main():
     save_root = r'E:\mot\results\virconv_OCM'
     txt_path_0 = os.path.join(save_root, 'data'); mkdir_if_inexistence(txt_path_0)
     image_path_0 = os.path.join(save_root, 'image'); mkdir_if_inexistence(image_path_0)
-    enable_0002_override = os.environ.get('ENABLE_0002_OVERRIDE', '0').lower() in ('1', 'true', 'yes', 'on')
-    enable_global_override = os.environ.get('ENABLE_GLOBAL_OVERRIDE', '1').lower() in ('1', 'true', 'yes', 'on')
-    # Optional overrides for grid search
-    low_env = os.environ.get('ADAPTIVE_THRESHOLD_LOW')
-    vmax_env = os.environ.get('VELOCITY_VMAX')
-    try:
-        override_low = float(low_env) if low_env is not None else 0.565
-    except ValueError:
-        override_low = 0.565
-    try:
-        override_vmax = float(vmax_env) if vmax_env is not None else 12.0
-    except ValueError:
-        override_vmax = 12.0
-
     # Open file to save in list.打开保存在列表里面的文件
     det_id2str = {1: 'Pedestrian', 2: 'Car', 3: 'Cyclist'}
     calib_files = os.listdir(calib_root) #返回指定的文件夹包含的文件或文件夹的名字的列表。
@@ -170,21 +156,20 @@ def main():
     # 保持外观权重
     tracker.tracker.appearance_weight_level1 = 0.10
 
-    # ========== 航向角创新点：前置航向冲突剔除 ==========
-    tracker.tracker.heading_ambiguity_rescore_enabled = False
-    tracker.tracker.heading_distance_metric = 'symmetric'
-    tracker.tracker.heading_pre_gate_enabled = True
-    tracker.tracker.heading_pre_gate_threshold = 0.55
-    print('[Heading Config] pre_gate_only=True threshold={:.2f}'.format(
-        tracker.tracker.heading_pre_gate_threshold,
+    # ========== 关闭航向角创新点 ==========
+    tracker.tracker.use_rotated_geom_in_l1 = True
+    tracker.tracker.use_rotated_geom_in_l2 = True
+    print('[Association Config] RotGeom(L1={}, L2={})'.format(
+        tracker.tracker.use_rotated_geom_in_l1,
+        tracker.tracker.use_rotated_geom_in_l2,
     ))
 
     # 优化速度自适应参数
     tracker.tracker.adaptive_threshold_low = 0.40  # 0.40
     tracker.tracker.adaptive_threshold_high = 0.70  # 0.70
 
-    # ========== 创新点2: L1.5速度回溯 ==========
-    tracker.tracker.velocity_backtrack_enabled = True  # ✅ 启用L1.5速度回溯
+    # ========== 仅打开 L1.5 速度回溯 ==========
+    tracker.tracker.velocity_backtrack_enabled = True
     tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
     tracker.tracker.adaptive_weight = True  # 启用自适应速度权重
     tracker.tracker.velocity_weight_vmax = 12.0  # 速度归一化最大值
@@ -193,8 +178,8 @@ def main():
     tracker.tracker.velocity_smooth_window = 3  # 速度平滑窗口
     tracker.tracker.trend_weight = 0.3  # 趋势权重
     
-    # ========== 创新点3: L2.5多帧回溯 ==========
-    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True  # ✅ 启用L2.5多帧回溯
+    # ========== 基线：关闭 L2.5 多帧回溯 ==========
+    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True
     tracker.tracker.multi_frame_config.min_backtrack_age = 4  # 最小回溯年龄
     tracker.tracker.multi_frame_config.max_backtrack_age = 15  # 最大回溯年龄
     tracker.tracker.multi_frame_config.lambda_decay = 0.15  # 时间衰减系数
@@ -205,9 +190,23 @@ def main():
     tracker.tracker.multi_frame_config.appearance_weight = 0.2  # 外观权重
     tracker.tracker.multi_frame_config.appearance_hard_gate = 0.50  # 外观硬门控
     tracker.tracker.multi_frame_config.verbose = False  # 关闭调试输出
+    tracker.tracker.multi_frame_config.use_l25_memory_bank_appearance = False
+    tracker.tracker.multi_frame_config.use_state_heading_in_l25 = False
+    tracker.tracker.multi_frame_config.state_heading_sigma = 0.45
+    tracker.tracker.multi_frame_config.memory_bank_size = 3
+    tracker.tracker.multi_frame_config.memory_bank_min_conf = 0.4
+    tracker.tracker.multi_frame_config.memory_bank_rescore_margin = 0.03
+    tracker.tracker.multi_frame_config.enable_candidate_pre_gate = False
+    tracker.tracker.multi_frame_config.candidate_min_iou = 0.03
+    tracker.tracker.multi_frame_config.candidate_min_size_ratio = 0.55
+    tracker.tracker.multi_frame_config.candidate_max_center_dist_base = 2.0
+    tracker.tracker.multi_frame_config.candidate_max_center_dist_per_dt = 0.35
     
-    # ========== 创新点4: 加速度门控 ==========
-    tracker.tracker.multi_frame_config.use_acceleration_gate = True  # ✅ 启用加速度门控
+    # ========== 基线：关闭加速度门控 ==========
+    tracker.tracker.multi_frame_config.enable_l25_cooldown = False
+    tracker.tracker.multi_frame_config.l25_cooldown_frames = 8
+    tracker.tracker.multi_frame_config.allowed_backtrack_dts = {1, 2, 4, 5}
+    tracker.tracker.multi_frame_config.use_acceleration_gate = False
     tracker.tracker.multi_frame_config.acceleration_threshold = 1.5  # 加速度阈值 (m/s²)
     
     # ========== 其他配置 ==========
@@ -216,8 +215,8 @@ def main():
     # Iterate through each data set 遍历数据集
     for seq_file_3D in detection_file_list_3D:
         seq_filename_txt, seq_id, _ = fileparts(seq_file_3D)
+        tracker.tracker.multi_frame_config.current_seq_id = seq_id
         print('--------------Start processing the {} dataset--------------'.format(seq_id))
-        tracker.tracker.reset_heading_stats()
         total_image = 0  # Record the total frames in this dataset记录此数据集的总帧数
         # Find matching 2D detection file by sequence id
         seq_file_2D = None
@@ -233,16 +232,10 @@ def main():
         txt_path = txt_path_0 + "\\" + seq_id + '.txt'
         image_path = image_path_0 + '\\' + seq_id; mkdir_if_inexistence(image_path)
         open(txt_path, 'w').close()
-        if enable_global_override or (enable_0002_override and seq_id == '0002'):
-            tracker.tracker.velocity_weight_vmax = override_vmax
-            tracker.tracker.adaptive_threshold_low = override_low
-            tracker.tracker.adaptive_threshold_mid = 0.65
-            tracker.tracker.adaptive_threshold_high = 0.72
-        else:
-            tracker.tracker.velocity_weight_vmax = 10.0
-            tracker.tracker.adaptive_threshold_low = 0.55
-            tracker.tracker.adaptive_threshold_mid = 0.60
-            tracker.tracker.adaptive_threshold_high = 0.70
+        tracker.tracker.velocity_weight_vmax = 10.0
+        tracker.tracker.adaptive_threshold_low = 0.55
+        tracker.tracker.adaptive_threshold_mid = 0.60
+        tracker.tracker.adaptive_threshold_high = 0.70
 
         calib_file = [calib_file for calib_file in calib_files if calib_file==seq_filename_txt]
         calib_file_seq = os.path.join(calib_root, ''.join(calib_file))
@@ -267,6 +260,7 @@ def main():
         min_frame, max_frame = int(seq_dets_3D[:, 0].min()), len(image_filenames)
 
         for frame, img0_path in zip(range(min_frame, max_frame + 1), image_filenames):
+            tracker.tracker.multi_frame_config.current_data_frame = frame
             img_0 = cv2.imread(img0_path)
             _, img0_name, _ = fileparts(img0_path)
             dets_3D_camera = seq_dets_3D[seq_dets_3D[:, 0] == frame, 7:14]  # 3D bounding box(h,w,l,x,y,z,theta)
@@ -350,18 +344,6 @@ def main():
                         # print(image_save_path)
 
         i += 1
-        heading_stats = tracker.tracker.heading_stats
-        print('[Heading Stats][{}] calls={} changed_calls={} changed_pairs={}'.format(
-            seq_id,
-            heading_stats.get('calls', 0),
-            heading_stats.get('changed_calls', 0),
-            heading_stats.get('changed_pairs', 0),
-        ))
-        print('[Heading PreGate][{}] suppressed_pairs={} changed_matches={}'.format(
-            seq_id,
-            heading_stats.get('pre_gate_suppressed_pairs', 0),
-            heading_stats.get('pre_gate_changed_matches', 0),
-        ))
         print('--------------The time it takes to process all datasets are {}s --------------'.format(total_time))
     
     # 输出 L1.5 和 L2.5 恢复统计

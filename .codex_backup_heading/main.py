@@ -1,0 +1,466 @@
+﻿from __future__ import print_function
+import os, numpy as np, time, cv2, torch, math
+from os import listdir
+from os.path import join
+from file_operation.file import load_list_from_folder, mkdir_if_inexistence, fileparts
+from detection.detection import Detection_2D, Detection_3D_only, Detection_3D_Fusion
+from tracking.tracker import Tracker
+from datasets.datafusion import datafusion2Dand3D
+from datasets.coordinate_transformation import convert_3dbox_to_8corner, convert_x1y1x2y2_to_tlwh
+from visualization.visualization_3d import show_image_with_boxes
+from visualization.visualization_2d import plot_one_box
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+
+
+def is_image_file(filename):
+    return any(filename.endswith(extension) for extension in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'])
+
+
+def compute_color_for_id(label):
+    """
+    Simple function that adds fixed color depending on the id
+    不同id给予不同的颜色
+    """
+    palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
+    color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
+    return tuple(color)
+
+
+class DeepFusion(object):
+    def __init__(self, max_age, min_hits,iou_shreshold=0.4):
+        '''
+        :param max_age:  The maximum frames in which an object disappears.消除目标轨迹的最大帧数
+        :param min_hits: The minimum frames in which an object becomes a trajectory in succession.成为轨迹的最小帧数
+        '''
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.tracker = Tracker(max_age, min_hits, grid_off=True, app_off=True)
+        self.reorder = [3, 4, 5, 6, 2, 1, 0]
+        self.reorder_back = [6, 5, 4, 0, 1, 2, 3]
+        self.frame_count = 0
+        self.iou_shreshold = iou_shreshold
+
+    def update(self,detection_3D_fusion,detection_2D_only,detection_3D_only,detection_3Dto2D_only,
+               additional_info, calib_file,img,detection_2D_only_conf, detection_3D_fusion_conf):
+
+        dets_3d_fusion = np.array(detection_3D_fusion['dets_3d_fusion'])
+        dets_3d_fusion_info = np.array(detection_3D_fusion['dets_3d_fusion_info'])
+        dets_3d_only = np.array(detection_3D_only['dets_3d_only'])
+        dets_3d_only_info = np.array(detection_3D_only['dets_3d_only_info'])
+
+        if len(dets_3d_fusion) == 0:
+            dets_3d_fusion = dets_3d_fusion
+        else:
+            dets_3d_fusion = dets_3d_fusion[:,self.reorder]  # convert [h,w,l,x,y,z,rot_y] to [x,y,z,rot_y，l,w,h]
+        if len(dets_3d_only) == 0:
+            dets_3d_only = dets_3d_only
+        else:
+            dets_3d_only = dets_3d_only[:, self.reorder] # convert [h,w,l,x,y,z,rot_y] to [x,y,z,rot_y，l,w,h]
+
+        detection_3D_fusion = [Detection_3D_Fusion(det_fusion, dets_3d_fusion_info[i]) for i, det_fusion in enumerate(dets_3d_fusion)]
+        detection_3D_only = [Detection_3D_only(det_only, dets_3d_only_info[i]) for i, det_only in enumerate(dets_3d_only)]
+        detection_2D_only = [Detection_2D(det_fusion) for i, det_fusion in enumerate(detection_2D_only)]
+
+        self.tracker.predict_2d()
+        self.tracker.predict_3d()
+        self.tracker.update(detection_3D_fusion, detection_3D_only, detection_3Dto2D_only, detection_2D_only, calib_file, img,detection_2D_only_conf, detection_3D_fusion_conf, self.iou_shreshold)
+
+        self.frame_count += 1
+        outputs = []
+        for track in self.tracker.tracks_3d:
+            if track.is_confirmed():
+                bbox = np.array(track.pose[self.reorder_back])
+                outputs.append(np.concatenate(([track.track_id_3d], bbox, track.additional_info)).reshape(1, -1))
+        if len(outputs) > 0:
+            outputs = np.stack(outputs, axis=0)
+            # print(outputs)
+        """提取出跟踪的2d轨迹"""
+        outputs_2d = []
+        for track in self.tracker.tracks_2d:
+            if track.is_confirmed():
+                bbox_2d = np.array(np.array(track.x1y1x2y2()))
+                # print(bbox_2d)
+                outputs_2d.append(np.concatenate(([track.track_id_2d],bbox_2d)).reshape(1,-1))
+        if len(outputs_2d) > 0:
+            outputs_2d = np.stack(outputs_2d,axis=0)
+            # print("2d轨迹",outputs_2d,type(outputs_2d))
+
+
+        return outputs,outputs_2d
+
+    @staticmethod
+    def _xywh_to_tlwh(bbox_xywh):  # Convert the coordinate format of the bbox box from center x, y, w, h to upper left x, upper left y, w, h
+        if isinstance(bbox_xywh, np.ndarray):
+            bbox_tlwh = bbox_xywh.copy()
+        elif isinstance(bbox_xywh, torch.Tensor):
+            bbox_tlwh = bbox_xywh.clone()
+        bbox_tlwh[:, 0] = bbox_xywh[:, 0] - bbox_xywh[:, 2] / 2.
+        bbox_tlwh[:, 1] = bbox_xywh[:, 1] - bbox_xywh[:, 3] / 2.
+        return bbox_tlwh
+
+    def _tlwh_to_xyxy(self, bbox_tlwh):
+        x, y, w, h = bbox_tlwh
+        x1 = max(int(x), 0)
+        x2 = min(int(x+w), 0)
+        y1 = max(int(y), 0)
+        y2 = min(int(y+h), 0)
+        return x1, y1, x2, y2
+
+    def _tlwh_to_x1y1x2y2(self, bbox_tlwh):
+        x, y, w, h = bbox_tlwh
+        x1 = x
+        x2 = x + w
+        y1 = y
+        y2 = y + h
+        return x1, y1, x2, y2
+
+
+def main():
+    # Define the file name
+    data_root = 'datasets/kitti/train'
+    detections_name_3D = '3D_virconv'  
+    detections_name_2D = '2D_rrc_Car'  
+
+    # Define the file path
+    calib_root = os.path.join(data_root, 'calib')     #矫正数据
+    dataset_dir = os.path.join(data_root,'image_02')
+    detections_root_3D = os.path.join(data_root, detections_name_3D)
+    detections_root_2D = os.path.join(data_root, detections_name_2D)
+    save_root = r'E:\mot\results\virconv_OCM'
+    txt_path_0 = os.path.join(save_root, 'data'); mkdir_if_inexistence(txt_path_0)
+    image_path_0 = os.path.join(save_root, 'image'); mkdir_if_inexistence(image_path_0)
+    enable_0002_override = os.environ.get('ENABLE_0002_OVERRIDE', '0').lower() in ('1', 'true', 'yes', 'on')
+    enable_global_override = os.environ.get('ENABLE_GLOBAL_OVERRIDE', '1').lower() in ('1', 'true', 'yes', 'on')
+    # Optional overrides for grid search
+    low_env = os.environ.get('ADAPTIVE_THRESHOLD_LOW')
+    vmax_env = os.environ.get('VELOCITY_VMAX')
+    try:
+        override_low = float(low_env) if low_env is not None else 0.565
+    except ValueError:
+        override_low = 0.565
+    try:
+        override_vmax = float(vmax_env) if vmax_env is not None else 12.0
+    except ValueError:
+        override_vmax = 12.0
+
+    # Open file to save in list.打开保存在列表里面的文件
+    det_id2str = {1: 'Pedestrian', 2: 'Car', 3: 'Cyclist'}
+    calib_files = os.listdir(calib_root) #返回指定的文件夹包含的文件或文件夹的名字的列表。
+    detections_files_3D = os.listdir(detections_root_3D)
+    detections_files_2D = os.listdir(detections_root_2D)
+    all_image_files = os.listdir(dataset_dir)
+    image_files = list(all_image_files)
+    detection_file_list_3D, num_seq_3D = load_list_from_folder(detections_files_3D, detections_root_3D)
+    detection_file_list_2D, num_seq_2D = load_list_from_folder(detections_files_2D, detections_root_2D)
+    image_file_list, _ = load_list_from_folder(image_files, dataset_dir)
+
+    # Pre-create empty result files for evaluator/consistency
+    parts = set(os.path.normpath(data_root).split(os.sep))
+    if 'train' in parts or 'training' in parts:
+        all_train_seqs = [f"{i:04d}" for i in range(21)]
+        for name in all_train_seqs:
+            open(os.path.join(txt_path_0, name + '.txt'), 'w').close()
+    else:
+        for name in all_image_files:
+            open(os.path.join(txt_path_0, name + '.txt'), 'w').close()
+
+    total_time, total_frames, i = 0.0, 0, 0  # Tracker runtime, total frames and Serial number of the dataset、跟踪器运行时，总时间、总帧数和数据集的序列号
+    tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)
+    
+    # ========== 航向角消融配置 ==========
+    # 可选:
+    #   'off'       -> 完全关闭角度
+    #   'cost_only' -> 只保留角度代价，不启用角度门控
+    #   'cost_gate' -> 角度代价 + 角度门控
+    #   'ambiguity_only' -> 只在歧义匹配时启用航向角，不再全局加权
+    angle_ablation_mode = 'ambiguity_only'
+
+    angle_enabled = angle_ablation_mode != 'off'
+    angle_gate_enabled = angle_ablation_mode == 'cost_gate'
+    angle_ambiguity_only = angle_ablation_mode == 'ambiguity_only'
+
+    tracker.tracker.enable_angle_in_level1 = angle_enabled
+    tracker.tracker.angle_config.enable_angle_feature = angle_enabled
+
+    # 基础角度配置
+    tracker.tracker.angle_config.angle_cost_method = 'symmetric'  # 对称性方法
+    tracker.tracker.angle_config.angle_cost_sigma = 0.35  # 基础 sigma
+    tracker.tracker.angle_config.angle_weight = 0.50  # 基础权重0.50
+    tracker.tracker.angle_config.enable_angle_gate = angle_gate_enabled
+    tracker.tracker.angle_config.angle_gate_threshold = math.radians(52)  # 52°
+    tracker.tracker.angle_config.enable_unique_iou_angle_gate = False  # 消融阶段默认关闭
+    tracker.tracker.angle_config.unique_iou_angle_threshold = math.radians(45)
+    tracker.tracker.angle_config.enable_ambiguity_triggered_angle = angle_ambiguity_only
+    tracker.tracker.angle_config.enable_ambiguity_gap_check = angle_ambiguity_only
+    tracker.tracker.angle_config.enable_heading_motion_consistency = angle_ambiguity_only
+
+    # ambiguity_only 小范围参数实验
+    # 可选:
+    #   1 -> sigma=0.30, iou_gap=0.03, min_candidates=2
+    #   2 -> sigma=0.35, iou_gap=0.05, min_candidates=2
+    #   3 -> sigma=0.30, iou_gap=0.05, min_candidates=3
+    heading_exp_id = 1
+    heading_exp_configs = {
+        1: {"heading_motion_sigma": 0.30, "ambiguity_iou_gap_threshold": 0.03, "ambiguity_min_candidates": 2},
+        2: {"heading_motion_sigma": 0.35, "ambiguity_iou_gap_threshold": 0.05, "ambiguity_min_candidates": 2},
+        3: {"heading_motion_sigma": 0.30, "ambiguity_iou_gap_threshold": 0.05, "ambiguity_min_candidates": 3},
+    }
+    heading_exp_cfg = heading_exp_configs.get(heading_exp_id, heading_exp_configs[1])
+    tracker.tracker.angle_config.ambiguity_min_candidates = heading_exp_cfg["ambiguity_min_candidates"]
+    tracker.tracker.angle_config.ambiguity_iou_gap_threshold = heading_exp_cfg["ambiguity_iou_gap_threshold"]
+    tracker.tracker.angle_config.heading_motion_sigma = heading_exp_cfg["heading_motion_sigma"]
+
+    tracker.tracker.angle_config.gamma_min = 0.20  # 0.20
+    tracker.tracker.angle_config.enable_speed_adaptive_sigma = False  # 关闭动态 sigma，使用静态 0.35
+    tracker.tracker.angle_config.speed_sigma_k = 0.25
+    tracker.tracker.angle_config.speed_sigma_min = 0.25
+    tracker.tracker.angle_config.speed_sigma_max = 0.60
+    tracker.tracker.angle_config.enable_path_aware_weighting = angle_enabled and (not angle_ambiguity_only)
+    tracker.tracker.angle_config.fused_cost_angle_boost = 1.8
+
+    # ❌ 禁用身份冲突校验（实验8失败）
+    tracker.tracker.angle_config.enable_angle_conflict_check = False
+    
+    # 保持外观权重
+    tracker.tracker.appearance_weight_level1 = 0.10  # 0.10
+    
+    # 优化速度自适应参数
+    tracker.tracker.adaptive_threshold_low = 0.40  # 0.40
+    tracker.tracker.adaptive_threshold_high = 0.70  # 0.70
+    
+    tracker.tracker.angle_config.verbose = False  # 关闭调试输出
+    
+    # ========== 创新点2: L1.5速度回溯 ==========
+    tracker.tracker.velocity_backtrack_enabled = True  # ✅ 启用L1.5速度回溯
+    tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
+    tracker.tracker.adaptive_weight = True  # 启用自适应速度权重
+    tracker.tracker.velocity_weight_vmax = 12.0  # 速度归一化最大值
+    tracker.tracker.use_velocity_trend = True  # 启用速度趋势
+    tracker.tracker.use_smooth_velocity = True  # 启用速度平滑
+    tracker.tracker.velocity_smooth_window = 3  # 速度平滑窗口
+    tracker.tracker.trend_weight = 0.3  # 趋势权重
+    
+    # ========== 创新点3: L2.5多帧回溯 ==========
+    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True  # ✅ 启用L2.5多帧回溯
+    tracker.tracker.multi_frame_config.min_backtrack_age = 4  # 最小回溯年龄
+    tracker.tracker.multi_frame_config.max_backtrack_age = 15  # 最大回溯年龄
+    tracker.tracker.multi_frame_config.lambda_decay = 0.15  # 时间衰减系数
+    tracker.tracker.multi_frame_config.cost_threshold = -0.35  # 代价阈值
+    tracker.tracker.multi_frame_config.last_k_frames = 5  # 回溯帧数
+    tracker.tracker.multi_frame_config.detection_buffer_size = 5  # 检测缓冲大小
+    tracker.tracker.multi_frame_config.topk_per_frame = 1  # 每帧top-k
+    tracker.tracker.multi_frame_config.appearance_weight = 0.2  # 外观权重
+    tracker.tracker.multi_frame_config.appearance_hard_gate = 0.50  # 外观硬门控
+    tracker.tracker.multi_frame_config.verbose = False  # 关闭调试输出
+    
+    # ========== 创新点4: 加速度门控 ==========
+    tracker.tracker.multi_frame_config.use_acceleration_gate = True  # ✅ 启用加速度门控
+    tracker.tracker.multi_frame_config.acceleration_threshold = 1.5  # 加速度阈值 (m/s²)
+    
+    # ========== 其他配置 ==========
+    tracker.tracker.embedding_off = False  # 保持外观特征提取
+    tracker.tracker.enable_angle_gate_in_backtrack = False  # L1.5中不使用角度门控
+    
+    # 验证配置
+    print("\n" + "="*60)
+    print("实验9配置: 全部创新点启用")
+    print("="*60)
+    print(f"核心思想: 综合所有优化策略，最大化IDSW降低")
+    print(f"")
+    print(f"创新点1: 角度特征（路径感知权重增强）")
+    print(f"  ✅ 启用角度特征")
+    print(f"  ✅ 路径感知权重增强 (fused_cost: 0.50 → 0.90)")
+    print(f"  预期贡献: -10 IDSW (已验证)")
+    print(f"")
+    print(f"创新点2: L1.5速度回溯")
+    print(f"  ✅ 启用速度自适应回溯关联")
+    print(f"  ✅ 速度趋势 + 速度平滑")
+    print(f"  预期贡献: -3到-5 IDSW")
+    print(f"")
+    print(f"创新点3: L2.5多帧回溯")
+    print(f"  ✅ 启用多帧历史回溯关联")
+    print(f"  ✅ 时间衰减 + 外观门控")
+    print(f"  预期贡献: -5到-8 IDSW")
+    print(f"")
+    print(f"创新点4: 加速度门控")
+    print(f"  ✅ 启用加速度物理约束")
+    print(f"  ✅ 阈值: 1.5 m/s²")
+    print(f"  预期贡献: -2到-3 IDSW")
+    print(f"")
+    print(f"预期效果:")
+    print(f"  基线: IDSW = 134")
+    print(f"  + 角度特征: IDSW = 124 (贡献-10)")
+    print(f"  + L1.5: IDSW ≈ 119-121 (贡献-3到-5)")
+    print(f"  + L2.5: IDSW ≈ 111-116 (贡献-5到-8)")
+    print(f"  + 加速度: IDSW ≈ 108-114 (贡献-2到-3)")
+    print(f"  目标: IDSW < 99 ✅")
+    print("="*60 + "\n")
+    
+
+    # Iterate through each data set 遍历数据集
+    for seq_file_3D in detection_file_list_3D:
+        seq_filename_txt, seq_id, _ = fileparts(seq_file_3D)
+        print('--------------Start processing the {} dataset--------------'.format(seq_id))
+        total_image = 0  # Record the total frames in this dataset记录此数据集的总帧数
+        # Find matching 2D detection file by sequence id
+        seq_file_2D = None
+        for f2d in detection_file_list_2D:
+            s2d_filename_txt, s2d_id, _ = fileparts(f2d)
+            if s2d_id == seq_id:
+                seq_file_2D = f2d
+                break
+        if seq_file_2D is None:
+            print(f"⚠️  序列 {seq_id} 缺少2D检测，写入空结果")
+            i += 1
+            continue
+        txt_path = txt_path_0 + "\\" + seq_id + '.txt'
+        image_path = image_path_0 + '\\' + seq_id; mkdir_if_inexistence(image_path)
+        open(txt_path, 'w').close()
+        if enable_global_override or (enable_0002_override and seq_id == '0002'):
+            tracker.tracker.velocity_weight_vmax = override_vmax
+            tracker.tracker.adaptive_threshold_low = override_low
+            tracker.tracker.adaptive_threshold_mid = 0.65
+            tracker.tracker.adaptive_threshold_high = 0.72
+        else:
+            tracker.tracker.velocity_weight_vmax = 10.0
+            tracker.tracker.adaptive_threshold_low = 0.55
+            tracker.tracker.adaptive_threshold_mid = 0.60
+            tracker.tracker.adaptive_threshold_high = 0.70
+
+        calib_file = [calib_file for calib_file in calib_files if calib_file==seq_filename_txt]
+        calib_file_seq = os.path.join(calib_root, ''.join(calib_file))
+        image_dir = os.path.join(dataset_dir, seq_id)
+        #image_dir = dataset_dir
+        image_filenames = [join(image_dir, x) for x in listdir(image_dir) if is_image_file(x)]
+        seq_dets_3D = np.loadtxt(seq_file_3D, delimiter=',')  # load 3D detections, N x 15
+        seq_dets_2D = np.loadtxt(seq_file_2D, delimiter=',')  # load 2D detections, N x 6
+        
+        # 跳过空文件
+        if seq_dets_3D.size == 0 or seq_dets_2D.size == 0:
+            print(f"⚠️  序列 {seq_id} 检测为空，跳过")
+            i += 1
+            continue
+        
+        # 确保是 2D 数组
+        if seq_dets_3D.ndim == 1:
+            seq_dets_3D = seq_dets_3D.reshape(1, -1)
+        if seq_dets_2D.ndim == 1:
+            seq_dets_2D = seq_dets_2D.reshape(1, -1)
+
+        min_frame, max_frame = int(seq_dets_3D[:, 0].min()), len(image_filenames)
+
+        for frame, img0_path in zip(range(min_frame, max_frame + 1), image_filenames):
+            img_0 = cv2.imread(img0_path)
+            _, img0_name, _ = fileparts(img0_path)
+            dets_3D_camera = seq_dets_3D[seq_dets_3D[:, 0] == frame, 7:14]  # 3D bounding box(h,w,l,x,y,z,theta)
+            dets_8corners = [convert_3dbox_to_8corner(det_tmp) for det_tmp in dets_3D_camera]
+
+            ori_array = seq_dets_3D[seq_dets_3D[:, 0] == frame, -1].reshape((-1, 1))
+            other_array = seq_dets_3D[seq_dets_3D[:, 0] == frame, 1:7]
+            additional_info = np.concatenate((ori_array, other_array), axis=1) #concatenate拼接函数
+
+            dets_3Dto2D_image = seq_dets_3D[seq_dets_3D[:, 0] == frame, 2:6]
+            if len(seq_dets_2D)!=0:
+                try:
+                    dets_2D = seq_dets_2D[seq_dets_2D[:, 0] == frame, 1:5]   # 2D bounding box(x1,y1,x2,y2)
+                    dets_2D_conf = seq_dets_2D[seq_dets_2D[:, 0] == frame, -1]
+                except:
+                    print(seq_dets_2D)
+            else:
+                dets_2D = []
+                dets_2D_conf = []
+
+            # Data Fusion(3D and 2D detections)
+            detection_2D_fusion, detection_3Dto2D_fusion, detection_3D_fusion, detection_2D_only, detection_3Dto2D_only, detection_3D_only,detection_2D_only_conf,detection_3D_fusion_conf = \
+                datafusion2Dand3D(dets_3D_camera, dets_2D, dets_3Dto2D_image, additional_info,dets_2D_conf)
+
+            detection_2D_only_tlwh = np.array([convert_x1y1x2y2_to_tlwh(i) for i in detection_2D_only]) # (x1,y1,x2,y2) to (x,y,center_x,center_y)
+
+            start_time = time.time()
+            trackers,trackers_2d = tracker.update(detection_3D_fusion, detection_2D_only_tlwh, detection_3D_only, detection_3Dto2D_only,
+                                      additional_info, calib_file_seq,img_0, detection_2D_only_conf, detection_3D_fusion_conf)
+            cycle_time = time.time() - start_time
+            total_time += cycle_time
+
+            # Outputs
+            total_frames += 1 # Total frames for all datasets
+            total_image += 1 # Total frames for a dataset
+            if total_image % 50 == 0:
+                print("Now start processing the {} image of the {} dataset".format(total_image, seq_id))
+
+            img_vis = img_0.copy()
+            if len(trackers) > 0:
+                for d in trackers:
+                    bbox3d = d.flatten()
+                    bbox3d_tmp = bbox3d[1:8]  # 3D bounding box(h,w,l,x,y,z,theta)
+                    id_tmp = int(bbox3d[0])
+                    ori_tmp = bbox3d[8]
+                    type_tmp = det_id2str[bbox3d[9]]
+                    bbox2d_tmp_trk = bbox3d[10:14]
+                    conf_tmp = bbox3d[14]
+                    color = compute_color_for_id(id_tmp)
+                    label = f'{id_tmp} {type_tmp}'
+                    image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
+                    with open(txt_path, 'a') as f:
+                        str_to_srite = (
+                            f"{frame:d} {id_tmp:d} {type_tmp} 0 0 "
+                            f"{ori_tmp:.6f} "
+                            f"{bbox2d_tmp_trk[0]:.6f} {bbox2d_tmp_trk[1]:.6f} {bbox2d_tmp_trk[2]:.6f} {bbox2d_tmp_trk[3]:.6f} "
+                            f"{bbox3d_tmp[0]:.6f} {bbox3d_tmp[1]:.6f} {bbox3d_tmp[2]:.6f} {bbox3d_tmp[3]:.6f} "
+                            f"{bbox3d_tmp[4]:.6f} {bbox3d_tmp[5]:.6f} {bbox3d_tmp[6]:.6f} "
+                            f"{conf_tmp:.6f}\n"
+                        )
+                        f.write(str_to_srite)
+                        #show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
+            #if len(trackers_2d) > 0:
+                #for d in trackers_2d:
+                    #bbox2d = d.flatten()
+                    # print(bbox2d,type(bbox2d))
+                    #bbox2d_tmp = bbox2d[1:5]
+                    #id_tmp = int(bbox2d[0])
+                    #color = compute_color_for_id(id_tmp)
+                    #image_save_path = os.path.join(image_path, '%06d.jpg' % (int(img0_name)))
+                    #label = f'{id_tmp} {"car"}'
+                    #with open(txt_path, 'a') as f:
+                        #type_tmp = 'car'
+                        #str_to_srite = (
+                            #f"{frame:d} {id_tmp:d} {type_tmp} -1 -1 -10 "
+                            #f"{bbox2d_tmp[0]:.6f} {bbox2d_tmp[1]:.6f} {bbox2d_tmp[2]:.6f} {bbox2d_tmp[3]:.6f} "
+                            #f"-1000 -1000 -1000 -10 -1 -1 -1 -1\n"
+                        #)
+                        #f.write(str_to_srite)
+                        # plot_one_box(bbox2d,img_0,image_path,color,img0_name,label,line_thickness=1)
+                        # print(image_save_path)
+
+        i += 1
+        print('--------------The time it takes to process all datasets are {}s --------------'.format(total_time))
+    
+    # 输出 L1.5 和 L2.5 恢复统计
+    print('============== 轨迹恢复统计 ==============')
+    print(f'L1.5 (速度回溯) 总恢复: {tracker.tracker.total_L15_recoveries}')
+    print(f'L2.5 (多帧回溯) 总恢复: {tracker.tracker.total_L25_recoveries}')
+    print('===========================================')
+    
+    # Per-level timing summary
+    t1 = tracker.tracker.t_L1
+    t15 = tracker.tracker.t_L15
+    t2 = tracker.tracker.t_L2
+    t3 = tracker.tracker.t_L3
+    t4 = tracker.tracker.t_L4
+    t_sum = t1 + t15 + t2 + t3 + t4
+    t_other = max(total_time - t_sum, 0.0)
+    def pct(x):
+        return 100.0 * x / total_time if total_time > 0 else 0.0
+    print('============== Per-Level Time ==============')
+    print('L1   (融合3D):      {:.3f}s ({:.2f}%)'.format(t1, pct(t1)))
+    print('L1.5 (速度回溯):    {:.3f}s ({:.2f}%)'.format(t15, pct(t15)))
+    print('L2   (仅3D):        {:.3f}s ({:.2f}%)'.format(t2, pct(t2)))
+    print('L3   (仅2D):        {:.3f}s ({:.2f}%)'.format(t3, pct(t3)))
+    print('L4   (2D→3D跨域):  {:.3f}s ({:.2f}%)'.format(t4, pct(t4)))
+    print('其他(数据装载/写盘等): {:.3f}s ({:.2f}%)'.format(t_other, pct(t_other)))
+    print('===========================================')
+    print('--------------FPS = {} --------------'.format(total_frames/total_time))
+
+
+if __name__ == '__main__':
+    main()

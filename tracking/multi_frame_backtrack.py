@@ -3,6 +3,8 @@
 用于恢复超过3帧未关联的轨迹
 """
 
+import os
+import math
 import numpy as np
 from tracking.cost_function import get_velocity, compute_adaptive_weight_linear, estimate_detection_velocity, compute_velocity_similarity as compute_velocity_similarity_vec
 from tracking.matching import linear_assignment
@@ -50,7 +52,92 @@ class MultiFrameBacktrackConfig:
         # 加速度门控：只在加速度显著时使用非线性
         self.use_acceleration_gate = True       # ✅ 启用加速度门控
         self.acceleration_threshold = 1.5       # 加速度阈值 (m/s²)，超过此值才用非线性
+        self.enable_covariance_diag_log = False
+        self.covariance_diag_log_path = None
+        self.current_seq_id = None
+        self.current_data_frame = None
+        self.enable_hit_event_log = False
+        self.hit_event_log_path = None
+        self.enable_final_hit_event_log = False
+        self.final_hit_event_log_path = None
+        self.enable_l25_cooldown = False
+        self.l25_cooldown_frames = 8
+        self.allowed_backtrack_dts = None
+        self.enable_candidate_pre_gate = True
+        self.candidate_min_iou = 0.03
+        self.candidate_min_size_ratio = 0.55
+        self.candidate_max_center_dist_base = 2.0
+        self.candidate_max_center_dist_per_dt = 0.35
+        self.use_state_heading_in_l25 = False
+        self.state_heading_sigma = 0.45
+        self.use_l25_memory_bank_appearance = False
+        self.memory_bank_size = 3
+        self.memory_bank_min_conf = 0.4
+        self.memory_bank_rescore_margin = 0.03
+        self.enable_memory_bank_stats_log = False
+        self.memory_bank_stats_log_path = None
+        self.memory_bank_stats = None
 
+
+def reset_memory_bank_stats(config):
+    if config is None:
+        return
+    config.memory_bank_stats = {
+        'calls': 0,
+        'pairs_considered': 0,
+        'pairs_with_memory_bank': 0,
+        'pairs_app_changed': 0,
+        'pairs_cost_changed': 0,
+        'assignment_calls': 0,
+        'assignment_changed_calls': 0,
+        'assignment_changed_pairs': 0,
+        'ambiguous_rows': 0,
+        'ambiguous_cols': 0,
+        'rescored_pairs': 0,
+    }
+
+
+def _ensure_memory_bank_stats(config):
+    if config is None:
+        return None
+    if getattr(config, 'memory_bank_stats', None) is None:
+        reset_memory_bank_stats(config)
+    return config.memory_bank_stats
+
+
+def append_memory_bank_stats_log(config):
+    if config is None or not getattr(config, 'enable_memory_bank_stats_log', False):
+        return
+    log_path = getattr(config, 'memory_bank_stats_log_path', None)
+    stats = _ensure_memory_bank_stats(config)
+    if not log_path or stats is None:
+        return
+    try:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        seq_id = getattr(config, 'current_seq_id', 'unknown')
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                '[L2.5 MemoryBank Stats][{}] calls={} pairs_considered={} pairs_with_memory_bank={} '
+                'pairs_app_changed={} pairs_cost_changed={} assignment_calls={} '
+                'assignment_changed_calls={} assignment_changed_pairs={} ambiguous_rows={} ambiguous_cols={} rescored_pairs={}\n'.format(
+                    seq_id,
+                    int(stats.get('calls', 0)),
+                    int(stats.get('pairs_considered', 0)),
+                    int(stats.get('pairs_with_memory_bank', 0)),
+                    int(stats.get('pairs_app_changed', 0)),
+                    int(stats.get('pairs_cost_changed', 0)),
+                    int(stats.get('assignment_calls', 0)),
+                    int(stats.get('assignment_changed_calls', 0)),
+                    int(stats.get('assignment_changed_pairs', 0)),
+                    int(stats.get('ambiguous_rows', 0)),
+                    int(stats.get('ambiguous_cols', 0)),
+                    int(stats.get('rescored_pairs', 0)),
+                )
+            )
+    except Exception:
+        pass
 
 def compute_decay_factor(time_diff, lambda_decay=0.1):
     """
@@ -65,6 +152,82 @@ def compute_decay_factor(time_diff, lambda_decay=0.1):
     """
     decay = np.exp(-lambda_decay * time_diff)
     return decay
+
+
+def _safe_diag_values(matrix, limit=10):
+    try:
+        diag = np.diag(matrix).reshape(-1)
+        return [float(x) for x in diag[:limit]]
+    except Exception:
+        return []
+
+
+def _append_covariance_diag_log(config, track, detection_frame_id, current_frame, dt,
+                                decay, diag_before, diag_after_update, diag_after_fast_forward):
+    if config is None or not getattr(config, 'enable_covariance_diag_log', False):
+        return
+
+    log_path = getattr(config, 'covariance_diag_log_path', None)
+    if not log_path:
+        return
+
+    try:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        seq_id = getattr(config, 'current_seq_id', 'unknown')
+        curr_frame = getattr(config, 'current_data_frame', None)
+        curr_frame = -1 if curr_frame is None else int(curr_frame)
+        track_id = int(getattr(track, 'track_id_3d', -1))
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                '[L2.5 CovDiag] seq={} frame={} track_id={} det_frame={} dt={} decay={:.6f} '
+                'diag_before={} diag_after_update={} diag_after_fast_forward={}\n'.format(
+                    seq_id,
+                    curr_frame,
+                    track_id,
+                    int(detection_frame_id),
+                    int(dt),
+                    float(decay),
+                    diag_before,
+                    diag_after_update,
+                    diag_after_fast_forward,
+                )
+            )
+    except Exception:
+        pass
+
+
+def _append_l25_hit_event_log(config, track, detection_frame_id, current_frame, dt, decay, time_since_update):
+    if config is None or not getattr(config, 'enable_hit_event_log', False):
+        return
+
+    log_path = getattr(config, 'hit_event_log_path', None)
+    if not log_path:
+        return
+
+    try:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        seq_id = getattr(config, 'current_seq_id', 'unknown')
+        curr_frame = getattr(config, 'current_data_frame', None)
+        curr_frame = -1 if curr_frame is None else int(curr_frame)
+        track_id = int(getattr(track, 'track_id_3d', -1))
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                '[L2.5 Hit] seq={} frame={} track_id={} det_frame={} dt={} decay={:.6f} tsu={}\n'.format(
+                    seq_id,
+                    curr_frame,
+                    track_id,
+                    int(detection_frame_id),
+                    int(dt),
+                    float(decay),
+                    int(time_since_update),
+                )
+            )
+    except Exception:
+        pass
 
 
 def get_pose_at_past_frame(track, time_diff, use_nonlinear=True, verbose=False, config=None):
@@ -264,6 +427,148 @@ def compute_appearance_similarity(track, detection):
     return 0.5  # 默认中等相似度
 
 
+def compute_memory_bank_appearance_similarity(track, detection):
+    if not hasattr(detection, 'feature') or detection.feature is None:
+        return compute_appearance_similarity(track, detection)
+    if not hasattr(track, 'appearance_memory_bank') or len(track.appearance_memory_bank) == 0:
+        return compute_appearance_similarity(track, detection)
+
+    try:
+        de = np.asarray(detection.feature).reshape(-1)
+        if de.size <= 1:
+            return compute_appearance_similarity(track, detection)
+        de = de / (np.linalg.norm(de) + 1e-6)
+        best_sim = None
+        for mem in track.appearance_memory_bank:
+            me = np.asarray(mem).reshape(-1)
+            min_dim = int(min(me.size, de.size))
+            if min_dim <= 1:
+                continue
+            me_use = me[:min_dim]
+            de_use = de[:min_dim]
+            me_use = me_use / (np.linalg.norm(me_use) + 1e-6)
+            de_use = de_use / (np.linalg.norm(de_use) + 1e-6)
+            sim = float(np.dot(me_use, de_use))
+            sim = max(-1.0, min(1.0, sim))
+            sim = 0.5 * (sim + 1.0)
+            if best_sim is None or sim > best_sim:
+                best_sim = sim
+        if best_sim is None:
+            return compute_appearance_similarity(track, detection)
+        return float(best_sim)
+    except Exception:
+        return compute_appearance_similarity(track, detection)
+
+
+def compute_memory_bank_appearance_details(track, detection):
+    base_sim = compute_appearance_similarity(track, detection)
+    if not hasattr(detection, 'feature') or detection.feature is None:
+        return float(base_sim), float(base_sim), False
+    if not hasattr(track, 'appearance_memory_bank') or len(track.appearance_memory_bank) == 0:
+        return float(base_sim), float(base_sim), False
+    mem_sim = compute_memory_bank_appearance_similarity(track, detection)
+    return float(mem_sim), float(base_sim), True
+
+
+def _build_l25_cost(iou, vel_sim, app_sim, track, config, w_vel_t, uncertainty, decay):
+    cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
+    base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
+    reliable = (app_sim >= 0.6)
+    w_app = base_app if reliable else min(0.05, base_app)
+    residual = max(0.0, 1.0 - w_app)
+    w_vel = residual * w_vel_t * (1.0 - uncertainty)
+    w_vel = max(0.1, w_vel)
+    w_vel = min(w_vel, residual)
+    w_iou = max(0.0, residual - w_vel)
+    combined_sim = w_iou * iou + w_vel * vel_sim + w_app * app_sim
+    return float(-(combined_sim * decay))
+
+
+def _wrap_to_pi(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def _compute_l25_heading_consistency(track, detection, det_vel, dt, config):
+    if config is None or not getattr(config, 'use_state_heading_in_l25', False):
+        return None
+    try:
+        track_heading = float(track.get_predicted_heading(float(dt))) if hasattr(track, 'get_predicted_heading') else float(track.pose[3])
+    except Exception:
+        return None
+
+    obs_angles = []
+    obs_weights = []
+    try:
+        det_heading = float(detection.bbox[3])
+        det_conf = float(getattr(track, 'heading_conf_det', 0.5))
+        obs_angles.append(det_heading)
+        obs_weights.append(max(det_conf, 1e-3))
+    except Exception:
+        pass
+
+    try:
+        if det_vel is not None:
+            vx = float(det_vel[0])
+            vz = float(det_vel[2])
+            vel_heading = math.atan2(vz, vx + 1e-6)
+            speed = math.sqrt(vx * vx + vz * vz)
+            vel_conf = (1.0 - math.exp(-speed / 3.0)) * max(float(getattr(track, 'heading_conf_vel', 0.5)), 1e-3)
+            obs_angles.append(vel_heading)
+            obs_weights.append(max(vel_conf, 1e-3))
+    except Exception:
+        pass
+
+    if len(obs_angles) == 0:
+        return None
+
+    s = 0.0
+    c = 0.0
+    for ang, w in zip(obs_angles, obs_weights):
+        s += w * math.sin(ang)
+        c += w * math.cos(ang)
+    fused_obs = math.atan2(s, c) if (abs(s) > 1e-8 or abs(c) > 1e-8) else obs_angles[0]
+
+    delta = _wrap_to_pi(track_heading - fused_obs)
+    sigma = max(float(getattr(config, 'state_heading_sigma', 0.45)), 1e-3)
+    return float(math.exp(-0.5 * (delta / sigma) ** 2))
+
+
+def _passes_l25_candidate_pre_gate(rollback_pose, det_bbox, iou, dt, config):
+    if config is None or not getattr(config, 'enable_candidate_pre_gate', True):
+        return True
+
+    min_iou = float(getattr(config, 'candidate_min_iou', 0.03))
+    if float(iou) < min_iou:
+        return False
+
+    try:
+        trk_center = np.asarray(rollback_pose[:3], dtype=np.float32)
+        det_center = np.asarray(det_bbox[:3], dtype=np.float32)
+        center_dist = float(np.linalg.norm(trk_center[[0, 2]] - det_center[[0, 2]]))
+    except Exception:
+        center_dist = float('inf')
+
+    max_center_dist = (
+        float(getattr(config, 'candidate_max_center_dist_base', 2.0)) +
+        max(0.0, float(dt) - 1.0) * float(getattr(config, 'candidate_max_center_dist_per_dt', 0.35))
+    )
+    if center_dist > max_center_dist:
+        return False
+
+    try:
+        trk_size = np.maximum(np.asarray(rollback_pose[4:7], dtype=np.float32), 1e-6)
+        det_size = np.maximum(np.asarray(det_bbox[4:7], dtype=np.float32), 1e-6)
+        size_ratio = float(np.min(np.minimum(trk_size, det_size) / np.maximum(trk_size, det_size)))
+    except Exception:
+        size_ratio = 0.0
+
+    min_size_ratio = float(getattr(config, 'candidate_min_size_ratio', 0.55))
+    if size_ratio < min_size_ratio:
+        return False
+
+    return True
+
+
 def compute_decay_cost_matrix(track, detection_buffer, current_frame, 
                              config=None):
     """
@@ -285,31 +590,46 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
     if config is None:
         config = MultiFrameBacktrackConfig()
     # 仅考虑最近K帧，按时间就近优先
+    allowed_dts = getattr(config, 'allowed_backtrack_dts', None)
     frames = []
     for fid in detection_buffer.keys():
         dt = current_frame - fid
         if dt > 0 and dt <= getattr(config, 'last_k_frames', 5):
+            if allowed_dts is not None and dt not in allowed_dts:
+                continue
             frames.append((dt, fid))
     frames.sort(key=lambda x: x[0])  # t-1, t-2, ...
 
     for dt, fid in frames:
         detections = detection_buffer.get(fid, [])
-        decay = compute_decay_factor(dt, config.lambda_decay)
         per_frame = []
         for det in detections:
             # 相似度项（不使用角/角速度）
             # 方案A：将轨迹回推到历史帧，与历史检测计算IoU
             use_nonlinear = getattr(config, 'use_nonlinear_backtrack', True)
             rollback_pose = get_pose_at_past_frame(track, dt, use_nonlinear=use_nonlinear, config=config)
+            decay = compute_decay_factor(dt, config.lambda_decay)
             iou = compute_iou_3d(rollback_pose, det.bbox)
             if iou <= 1e-6:
                 continue
-            app_sim = compute_appearance_similarity(track, det)
+            if not _passes_l25_candidate_pre_gate(rollback_pose, det.bbox, iou, dt, config):
+                continue
+            if getattr(config, 'use_l25_memory_bank_appearance', False):
+                app_sim = compute_memory_bank_appearance_similarity(track, det)
+            else:
+                app_sim = compute_appearance_similarity(track, det)
             if app_sim < getattr(config, 'appearance_hard_gate', 0.6):
                 continue
             det_vel = estimate_detection_velocity(det, detection_buffer, fid)
             trk_vel = get_velocity(track)
             vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
+            heading_consistency = _compute_l25_heading_consistency(track, det, det_vel, dt, config)
+            if heading_consistency is not None:
+                heading_mix = max(0.0, min(1.0, 0.5 * (
+                    float(getattr(track, 'heading_conf_det', 0.5)) +
+                    float(getattr(track, 'heading_conf_vel', 0.5))
+                )))
+                vel_sim = (1.0 - heading_mix) * vel_sim + heading_mix * heading_consistency
             # 外观上限：短遮挡/长遮挡
             cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
             base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
@@ -352,81 +672,96 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
 def multi_frame_backtrack_association(unmatched_tracks, detection_buffer, 
                                      current_frame, config=None):
     """
-    执行多帧回溯关联
+    ??????
     
     Args:
-        unmatched_tracks: 未匹配的轨迹列表
-        detection_buffer: 检测缓冲 {frame_id: [detections]}
-        current_frame: 当前帧号
-        config: MultiFrameBacktrackConfig对象
+        unmatched_tracks: ???????
+        detection_buffer: ???? {frame_id: [detections]}
+        current_frame: ???
+        config: MultiFrameBacktrackConfig??
     
     Returns:
         matched_pairs: [(track, detection, detection_frame_id), ...]
     """
     if config is None:
         config = MultiFrameBacktrackConfig()
-    
+
     if not config.enable_multi_frame_backtrack:
         return []
-    
+
     matched_pairs = []
     used_detections = set()
+    cooldown_enabled = getattr(config, 'enable_l25_cooldown', False)
+    cooldown_frames = max(0, int(getattr(config, 'l25_cooldown_frames', 0)))
+    allowed_dts = getattr(config, 'allowed_backtrack_dts', None)
+    memory_bank_stats = _ensure_memory_bank_stats(config)
+    if memory_bank_stats is not None:
+        memory_bank_stats['calls'] += 1
 
-    # 路径1：全局最优（线性分配）
     if getattr(config, 'use_global_assignment', False):
-        # 1) 收集最近K帧的候选检测（按时间就近）
         frames = []
         for fid in detection_buffer.keys():
             dt = current_frame - fid
             if dt > 0 and dt <= getattr(config, 'last_k_frames', 5):
+                if allowed_dts is not None and dt not in allowed_dts:
+                    continue
                 frames.append((dt, fid))
         frames.sort(key=lambda x: x[0])
 
-        cand_list = []  # [(fid, det, dt, decay)]
+        cand_list = []
         seen = set()
         for dt, fid in frames:
-            decay = compute_decay_factor(dt, config.lambda_decay)
             for det in detection_buffer.get(fid, []):
-                # 去重：相同对象引用仅保留一次
                 det_id = id(det)
                 if det_id in seen:
                     continue
                 seen.add(det_id)
-                cand_list.append((fid, det, dt, decay))
+                cand_list.append((fid, det, dt, None))
 
         if len(cand_list) == 0 or len(unmatched_tracks) == 0:
             return matched_pairs
 
-        # 2) 构建代价矩阵（行=候选检测，列=轨迹），以便全局匹配
         INF = 1e6
+        use_memory_bank = bool(getattr(config, 'use_l25_memory_bank_appearance', False))
+        C_base = np.full((len(cand_list), len(unmatched_tracks)), INF, dtype=np.float32)
         C = np.full((len(cand_list), len(unmatched_tracks)), INF, dtype=np.float32)
+        mem_costs = np.full((len(cand_list), len(unmatched_tracks)), INF, dtype=np.float32) if use_memory_bank else None
+        mem_valid = np.zeros((len(cand_list), len(unmatched_tracks)), dtype=bool) if use_memory_bank else None
 
-        for j, (fid, det, dt, decay) in enumerate(cand_list):
+        for j, (fid, det, dt, _) in enumerate(cand_list):
             for i, track in enumerate(unmatched_tracks):
-                # 触发条件（轨迹年龄）
+                if cooldown_enabled:
+                    last_l25_frame = getattr(track, 'last_l25_recovery_frame', None)
+                    if last_l25_frame is not None and (current_frame - int(last_l25_frame)) <= cooldown_frames:
+                        continue
                 if not (config.min_backtrack_age <= track.time_since_update <= config.max_backtrack_age):
                     continue
-                # 相似度项
+
                 use_nonlinear = getattr(config, 'use_nonlinear_backtrack', True)
                 rollback_pose = get_pose_at_past_frame(track, dt, use_nonlinear=use_nonlinear, config=config)
+                decay = compute_decay_factor(dt, config.lambda_decay)
                 iou = compute_iou_3d(rollback_pose, det.bbox)
                 if iou <= 1e-6:
                     continue
-                app_sim = compute_appearance_similarity(track, det)
-                if app_sim < getattr(config, 'appearance_hard_gate', 0.6):
+                if not _passes_l25_candidate_pre_gate(rollback_pose, det.bbox, iou, dt, config):
                     continue
+
+                base_app_sim = compute_appearance_similarity(track, det)
+                if base_app_sim < getattr(config, 'appearance_hard_gate', 0.6):
+                    continue
+
                 det_vel = estimate_detection_velocity(det, detection_buffer, fid)
                 trk_vel = get_velocity(track)
                 vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
-                # 外观权重（自适应上限）
-                cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
-                base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
-                reliable = (app_sim >= 0.6)
-                w_app = base_app if reliable else min(0.05, base_app)
-                residual = max(0.0, 1.0 - w_app)
-                # 速度/位置分配 + 不确定性抑制
+                heading_consistency = _compute_l25_heading_consistency(track, det, det_vel, dt, config)
+                if heading_consistency is not None:
+                    heading_mix = max(0.0, min(1.0, 0.5 * (
+                        float(getattr(track, 'heading_conf_det', 0.5)) +
+                        float(getattr(track, 'heading_conf_vel', 0.5))
+                    )))
+                    vel_sim = (1.0 - heading_mix) * vel_sim + heading_mix * heading_consistency
                 vmax = getattr(config, 'vmax_for_adaptive_weight', 10.0)
-                w_vel_t, w_pos_t = compute_adaptive_weight_linear(get_velocity(track), v_max=vmax)
+                w_vel_t, _ = compute_adaptive_weight_linear(get_velocity(track), v_max=vmax)
                 uncertainty = 0.0
                 try:
                     P = track.kf_3d.kf.P
@@ -436,66 +771,140 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                     uncertainty = max(0.0, min(1.0, (sx + sz) / max(u_norm, 1e-6)))
                 except Exception:
                     uncertainty = 0.0
-                w_vel = residual * w_vel_t * (1.0 - uncertainty)
-                # 速度权重下限
-                w_vel = max(0.1, w_vel)
-                w_vel = min(w_vel, residual)
-                w_iou = max(0.0, residual - w_vel)
-                combined_sim = w_iou * iou + w_vel * vel_sim + w_app * app_sim
-                decayed_sim = combined_sim * decay
-                cost = -decayed_sim
-                # 预门控：若综合相似度太低，则直接屏蔽该对
-                if cost >= config.cost_threshold:
+
+                base_cost = _build_l25_cost(
+                    iou=iou,
+                    vel_sim=vel_sim,
+                    app_sim=float(base_app_sim),
+                    track=track,
+                    config=config,
+                    w_vel_t=w_vel_t,
+                    uncertainty=uncertainty,
+                    decay=decay,
+                )
+                if base_cost >= config.cost_threshold:
                     continue
-                C[j, i] = cost
-        # 统计：候选对总数、通过预门控数量、decayed_sim 统计
-        pairs_total = int(C.shape[0] * C.shape[1])
-        if pairs_total > 0:
-            mask = (C < INF)
-            if mask.any():
-                sims = -C[mask]
-                smin = float(np.min(sims))
-                smean = float(np.mean(sims))
-                smax = float(np.max(sims))
-            else:
-                pass
-        # 3) 线性分配（全局最优）
+
+                C_base[j, i] = base_cost
+                C[j, i] = base_cost
+
+                if memory_bank_stats is not None:
+                    memory_bank_stats['pairs_considered'] += 1
+
+                if use_memory_bank:
+                    mem_app_sim, base_app_dup, used_memory_bank_pair = compute_memory_bank_appearance_details(track, det)
+                    if memory_bank_stats is not None and used_memory_bank_pair:
+                        memory_bank_stats['pairs_with_memory_bank'] += 1
+                        if abs(float(mem_app_sim) - float(base_app_dup)) > 1e-6:
+                            memory_bank_stats['pairs_app_changed'] += 1
+                    if used_memory_bank_pair and mem_app_sim >= getattr(config, 'appearance_hard_gate', 0.6):
+                        mem_cost = _build_l25_cost(
+                            iou=iou,
+                            vel_sim=vel_sim,
+                            app_sim=float(mem_app_sim),
+                            track=track,
+                            config=config,
+                            w_vel_t=w_vel_t,
+                            uncertainty=uncertainty,
+                            decay=decay,
+                        )
+                        if mem_cost < config.cost_threshold:
+                            mem_costs[j, i] = mem_cost
+                            mem_valid[j, i] = True
+                            if memory_bank_stats is not None and abs(float(mem_cost) - float(base_cost)) > 1e-6:
+                                memory_bank_stats['pairs_cost_changed'] += 1
+
+        if use_memory_bank and mem_costs is not None and mem_valid is not None:
+            margin = float(getattr(config, 'memory_bank_rescore_margin', 0.03))
+            ambiguous_rows = set()
+            ambiguous_cols = set()
+
+            for row_idx in range(C_base.shape[0]):
+                finite_vals = C_base[row_idx][C_base[row_idx] < INF]
+                if finite_vals.size >= 2:
+                    sorted_vals = np.sort(finite_vals)
+                    if float(sorted_vals[1] - sorted_vals[0]) <= margin:
+                        ambiguous_rows.add(row_idx)
+
+            for col_idx in range(C_base.shape[1]):
+                finite_vals = C_base[:, col_idx][C_base[:, col_idx] < INF]
+                if finite_vals.size >= 2:
+                    sorted_vals = np.sort(finite_vals)
+                    if float(sorted_vals[1] - sorted_vals[0]) <= margin:
+                        ambiguous_cols.add(col_idx)
+
+            if memory_bank_stats is not None:
+                memory_bank_stats['ambiguous_rows'] += len(ambiguous_rows)
+                memory_bank_stats['ambiguous_cols'] += len(ambiguous_cols)
+
+            rescored_pairs = set()
+            for row_idx in ambiguous_rows:
+                for col_idx in np.where(mem_valid[row_idx])[0]:
+                    C[row_idx, col_idx] = mem_costs[row_idx, col_idx]
+                    rescored_pairs.add((int(row_idx), int(col_idx)))
+            for col_idx in ambiguous_cols:
+                for row_idx in np.where(mem_valid[:, col_idx])[0]:
+                    C[row_idx, col_idx] = mem_costs[row_idx, col_idx]
+                    rescored_pairs.add((int(row_idx), int(col_idx)))
+
+            if memory_bank_stats is not None:
+                memory_bank_stats['rescored_pairs'] += len(rescored_pairs)
+
         assign = linear_assignment(C)
+        if use_memory_bank and memory_bank_stats is not None:
+            memory_bank_stats['assignment_calls'] += 1
+            assign_base = linear_assignment(C_base)
+            bank_set = set()
+            base_set = set()
+            if getattr(assign, 'size', 0) != 0:
+                for row_idx, col_idx in assign:
+                    if row_idx < 0 or row_idx >= C.shape[0] or col_idx < 0 or col_idx >= C.shape[1]:
+                        continue
+                    pair_cost = float(C[row_idx, col_idx])
+                    if np.isfinite(pair_cost) and pair_cost < config.cost_threshold:
+                        bank_set.add((int(row_idx), int(col_idx)))
+            if getattr(assign_base, 'size', 0) != 0:
+                for row_idx, col_idx in assign_base:
+                    if row_idx < 0 or row_idx >= C_base.shape[0] or col_idx < 0 or col_idx >= C_base.shape[1]:
+                        continue
+                    pair_cost = float(C_base[row_idx, col_idx])
+                    if np.isfinite(pair_cost) and pair_cost < config.cost_threshold:
+                        base_set.add((int(row_idx), int(col_idx)))
+            diff_pairs = bank_set.symmetric_difference(base_set)
+            if len(diff_pairs) > 0:
+                memory_bank_stats['assignment_changed_calls'] += 1
+                memory_bank_stats['assignment_changed_pairs'] += len(diff_pairs)
+
         if assign.size == 0:
             return matched_pairs
-        # assign 的格式与 matching.linear_assignment 一致：行索引在 [:,0]，列索引在 [:,1]
+
         for row_idx, col_idx in assign:
-            # 防御：检查是否为有效匹配
             if row_idx < 0 or row_idx >= C.shape[0] or col_idx < 0 or col_idx >= C.shape[1]:
                 continue
             pair_cost = float(C[row_idx, col_idx])
             if not np.isfinite(pair_cost) or pair_cost >= config.cost_threshold:
                 continue
-            fid, det, dt, decay = cand_list[int(row_idx)]
+            fid, det, dt, _ = cand_list[int(row_idx)]
             track = unmatched_tracks[int(col_idx)]
+            decay = compute_decay_factor(dt, config.lambda_decay)
             matched_pairs.append((track, det, fid, dt, decay))
             if config.verbose:
-                print(f"[多帧关联-GLOBAL] 轨迹{track.track_id_3d} ⇐ 帧{fid} (Δt={dt}) 代价={pair_cost:.4f}")
-        
-        # 统计 Δt 分布
-        if len(matched_pairs) > 0:
-            dt_list = [dt for _, _, _, dt, _ in matched_pairs]
-            from collections import Counter
-            dt_dist = Counter(dt_list)
-        
+                print(f"[????-GLOBAL] track={track.track_id_3d} fid={fid} dt={dt} cost={pair_cost:.4f}")
+
         return matched_pairs
-    # 路径2：保留原贪心（回退）
+
     for track in unmatched_tracks:
-        # 检查是否满足触发条件
+        if cooldown_enabled:
+            last_l25_frame = getattr(track, 'last_l25_recovery_frame', None)
+            if last_l25_frame is not None and (current_frame - int(last_l25_frame)) <= cooldown_frames:
+                continue
         if not (config.min_backtrack_age <= track.time_since_update <= config.max_backtrack_age):
             continue
-        # 获取候选并按就近优先顺序检查
         candidates = compute_decay_cost_matrix(
             track, detection_buffer, current_frame, config
         )
         if not candidates:
             continue
-        # 顺序扫描，找到第一个过阈值且未被使用的候选
         selected = None
         for fid, det, cst, time_diff, decay in candidates:
             if cst < config.cost_threshold and (id(det) not in used_detections):
@@ -507,11 +916,7 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
         matched_pairs.append((track, best_det, best_frame_id, time_diff, decay))
         used_detections.add(id(best_det))
         if config.verbose:
-            print(f"[多帧关联] 轨迹{track.track_id_3d}:")
-            print(f"  缺失帧数: {track.time_since_update}")
-            print(f"  匹配检测帧: {best_frame_id} (时间差: {time_diff})")
-            print(f"  衰减因子: {decay:.4f}")
-            print(f"  代价: {best_cost:.4f}")
+            print(f"[????] track={track.track_id_3d} frame={best_frame_id} dt={time_diff} cost={best_cost:.4f}")
     return matched_pairs
 
 
@@ -533,8 +938,10 @@ def process_multi_frame_matches(matched_pairs, virtual_update_config=None,
     
     for track, detection, detection_frame_id, time_diff, decay in matched_pairs:
         dt = int(max(0, time_diff))
+        time_since_update_before = int(getattr(track, 'time_since_update', -1))
         x_backup = track.kf_3d.kf.x.copy()
         P_backup = track.kf_3d.kf.P.copy()
+        diag_before = _safe_diag_values(P_backup)
         try:
             if hasattr(track, 'get_average_velocity') and hasattr(track, 'get_smooth_velocity_trend'):
                 smooth_vel = track.get_average_velocity(window=3)
@@ -545,11 +952,34 @@ def process_multi_frame_matches(matched_pairs, virtual_update_config=None,
             track.kf_3d.kf.x[7:10] = predicted_vel.reshape((3, 1))
             track.kf_3d.kf.x[:3] = track.kf_3d.kf.x[:3] - track.kf_3d.kf.x[7:10] * float(dt)
             track.update_3d(detection)
+            diag_after_update = _safe_diag_values(track.kf_3d.kf.P.copy())
             for _ in range(dt):
                 track.kf_3d.kf.predict()
+            diag_after_fast_forward = _safe_diag_values(track.kf_3d.kf.P.copy())
+            _append_covariance_diag_log(
+                virtual_update_config,
+                track,
+                detection_frame_id,
+                current_frame,
+                dt,
+                decay,
+                diag_before,
+                diag_after_update,
+                diag_after_fast_forward,
+            )
+            _append_l25_hit_event_log(
+                virtual_update_config,
+                track,
+                detection_frame_id,
+                current_frame,
+                dt,
+                decay,
+                time_since_update_before,
+            )
             track.fusion_time_update += 1
             track.last_backtrack_dt = dt
             track.last_decay_factor = decay
+            track.last_l25_recovery_frame = current_frame
             try:
                 if hasattr(track, 'reset_rassa'):
                     track.reset_rassa()
