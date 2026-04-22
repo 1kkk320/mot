@@ -6,7 +6,7 @@ from tracking import kalman_filter_2d
 from tracking.cost_function import (iou_batch, get_velocity, compute_velocity_similarity, 
                                      estimate_detection_velocity, compute_velocity_trend_similarity,
                                      compute_smooth_velocity_similarity, compute_adaptive_weight_linear)
-from tracking.matching import associate_detections_to_trackers_fusion, associate_2D_to_3D_tracking, linear_assignment,associate_detections_to_tracks
+from tracking.matching import associate_detections_to_trackers_fusion, associate_2D_to_3D_tracking, linear_assignment,associate_detections_to_tracks, compute_rotated_ground_similarity
 from tracking.track_2d import Track_2D
 from tracking.kalman_fileter_3d import  KalmanBoxTracker
 from tracking.track_3d import Track_3D, TrackState
@@ -85,6 +85,8 @@ class Tracker:
         self.heading_hard_gate_threshold = 0.45
         self.use_rotated_geom_in_l1 = False
         self.use_rotated_geom_in_l2 = False
+        self.use_rotated_geom_in_l15 = False
+        self.rotated_geom_weight_l15 = 0.20
         self.use_state_heading_in_l1 = False
         self.use_state_heading_in_l2 = False
         self.use_state_heading_in_l15 = False
@@ -817,6 +819,13 @@ class Tracker:
                     w_vel_t * velocity_matrix[d, t] +
                     w_pos_t * position_matrix[d, t]
                 )
+                if self.use_rotated_geom_in_l15:
+                    rotated_geom_sim = compute_rotated_ground_similarity(
+                        detections[d].bbox,
+                        tracks[t].pose,
+                    )
+                    geom_w = max(0.0, min(1.0, float(self.rotated_geom_weight_l15)))
+                    base_score = (1.0 - geom_w) * base_score + geom_w * rotated_geom_sim
                 if self.use_state_heading_in_l15:
                     heading_score = self._compute_state_heading_consistency(
                         tracks[t], detections[d]

@@ -7,7 +7,7 @@ import os
 import math
 import numpy as np
 from tracking.cost_function import get_velocity, compute_adaptive_weight_linear, estimate_detection_velocity, compute_velocity_similarity as compute_velocity_similarity_vec
-from tracking.matching import linear_assignment
+from tracking.matching import linear_assignment, compute_rotated_ground_similarity
 
 
 class MultiFrameBacktrackConfig:
@@ -70,6 +70,8 @@ class MultiFrameBacktrackConfig:
         self.candidate_max_center_dist_per_dt = 0.35
         self.use_state_heading_in_l25 = False
         self.state_heading_sigma = 0.45
+        self.use_rotated_geom_in_l25 = False
+        self.rotated_geom_weight_l25 = 0.10
         self.use_l25_memory_bank_appearance = False
         self.memory_bank_size = 3
         self.memory_bank_min_conf = 0.4
@@ -782,6 +784,10 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                     uncertainty=uncertainty,
                     decay=decay,
                 )
+                if getattr(config, 'use_rotated_geom_in_l25', False):
+                    rotated_geom_sim = compute_rotated_ground_similarity(det.bbox, rollback_pose)
+                    geom_w = max(0.0, min(1.0, float(getattr(config, 'rotated_geom_weight_l25', 0.10))))
+                    base_cost -= geom_w * rotated_geom_sim
                 if base_cost >= config.cost_threshold:
                     continue
 

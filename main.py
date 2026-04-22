@@ -159,6 +159,8 @@ def main():
     # ========== 关闭航向角创新点 ==========
     tracker.tracker.use_rotated_geom_in_l1 = True
     tracker.tracker.use_rotated_geom_in_l2 = True
+    tracker.tracker.use_rotated_geom_in_l15 = True
+    tracker.tracker.rotated_geom_weight_l15 = 0.20
     print('[Association Config] RotGeom(L1={}, L2={})'.format(
         tracker.tracker.use_rotated_geom_in_l1,
         tracker.tracker.use_rotated_geom_in_l2,
@@ -192,6 +194,8 @@ def main():
     tracker.tracker.multi_frame_config.verbose = False  # 关闭调试输出
     tracker.tracker.multi_frame_config.use_l25_memory_bank_appearance = False
     tracker.tracker.multi_frame_config.use_state_heading_in_l25 = False
+    tracker.tracker.multi_frame_config.use_rotated_geom_in_l25 = False
+    tracker.tracker.multi_frame_config.rotated_geom_weight_l25 = 0.10
     tracker.tracker.multi_frame_config.state_heading_sigma = 0.45
     tracker.tracker.multi_frame_config.memory_bank_size = 3
     tracker.tracker.multi_frame_config.memory_bank_min_conf = 0.4
