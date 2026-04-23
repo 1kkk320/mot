@@ -174,11 +174,29 @@ def main():
     tracker.tracker.velocity_backtrack_enabled = True
     tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
     tracker.tracker.adaptive_weight = True  # 启用自适应速度权重
+    tracker.tracker.l15_use_fixed_motion_position_weights = True
+    tracker.tracker.l15_fixed_motion_weight = 0.5
+    tracker.tracker.l15_fixed_position_weight = 0.5
     tracker.tracker.velocity_weight_vmax = 12.0  # 速度归一化最大值
     tracker.tracker.use_velocity_trend = True  # 启用速度趋势
     tracker.tracker.use_smooth_velocity = True  # 启用速度平滑
     tracker.tracker.velocity_smooth_window = 3  # 速度平滑窗口
     tracker.tracker.trend_weight = 0.3  # 趋势权重
+    tracker.tracker.use_confidence_aware_motion_l15 = True
+    tracker.tracker.l15_motion_reliability_bias = -0.2
+    tracker.tracker.l15_motion_reliability_score_gain = 2.5
+    tracker.tracker.l15_motion_reliability_uncertainty_gain = 2.0
+    tracker.tracker.l15_motion_reliability_neutral = 0.5
+    tracker.tracker.l15_motion_v4_high_sim_threshold = 0.8
+    tracker.tracker.l15_motion_v4_raw_focus_gain = 10.0
+    tracker.tracker.l15_motion_v4_gate_focus_gain = 8.0
+    tracker.tracker.l15_motion_v4_margin_center = 0.35
+    tracker.tracker.l15_motion_v4_margin_gain = 10.0
+    tracker.tracker.l15_motion_v4_min_effect = 0.01
+    tracker.tracker.enable_l15_motion_diag_log = True
+    tracker.tracker.l15_motion_diag_log_path = os.path.join(
+        'logs', 'l15_motion_diag.log'
+    )
     
     # ========== 基线：关闭 L2.5 多帧回溯 ==========
     tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True
@@ -215,6 +233,8 @@ def main():
     
     # ========== 其他配置 ==========
     tracker.tracker.embedding_off = False  # 保持外观特征提取
+    if tracker.tracker.enable_l15_motion_diag_log:
+        open(tracker.tracker.l15_motion_diag_log_path, 'w', encoding='utf-8').close()
     
     # Iterate through each data set 遍历数据集
     for seq_file_3D in detection_file_list_3D:

@@ -42,6 +42,9 @@ class Tracker:
         self.velocity_threshold = 0.6            # 速度相似度阈值
         self.velocity_weight = 0.5               # 默认速度权重 (0.5表示速度和位置各占50%)
         self.adaptive_weight = True              # 启用自适应速度权重 (方案B)
+        self.l15_use_fixed_motion_position_weights = False
+        self.l15_fixed_motion_weight = 0.5
+        self.l15_fixed_position_weight = 0.5
         self.detection_history = {}              # 历史检测缓存 {frame_id: detections}
         self.current_frame = 0                   # 当前帧计数
         self.velocity_weight_vmax = 12.0
@@ -60,6 +63,20 @@ class Tracker:
         self.trend_weight = 0.3                  # 趋势权重 (0.3表示30%趋势 + 70%当前速度)
         
         # ========== 多帧关联配置 ==========
+        self.use_confidence_aware_motion_l15 = False
+        self.l15_motion_reliability_bias = -0.2
+        self.l15_motion_reliability_score_gain = 2.5
+        self.l15_motion_reliability_uncertainty_gain = 2.0
+        self.l15_motion_reliability_neutral = 0.5
+        self.l15_motion_suppress_only_above = 0.5
+        self.l15_motion_v4_high_sim_threshold = 0.80
+        self.l15_motion_v4_raw_focus_gain = 10.0
+        self.l15_motion_v4_gate_focus_gain = 12.0
+        self.l15_motion_v4_margin_center = 0.10
+        self.l15_motion_v4_margin_gain = 20.0
+        self.l15_motion_v4_min_effect = 0.02
+        self.enable_l15_motion_diag_log = False
+        self.l15_motion_diag_log_path = None
         self.multi_frame_config = MultiFrameBacktrackConfig()
         self.multi_frame_config.vmax_for_adaptive_weight = 12.0
         self.multi_frame_config.enable_multi_frame_backtrack = False  # ❌ 基线：关闭L2.5多帧回溯
@@ -748,9 +765,11 @@ class Tracker:
 
         # 1. 计算速度相似度矩阵
         velocity_matrix = np.zeros((len(detections), len(tracks)))
+        motion_reliability_matrix = np.ones((len(detections), len(tracks)))
         
         if self.use_velocity_trend:
             trend_matrix = np.zeros((len(detections), len(tracks)))
+        l15_motion_diag_entries = {} if self.use_confidence_aware_motion_l15 else None
         
         for d, det in enumerate(detections):
             det_vel = estimate_detection_velocity(det, self.detection_history, self.current_frame)
@@ -763,6 +782,9 @@ class Tracker:
                 else:
                     trk_vel = get_velocity(trk)
                     velocity_matrix[d, t] = compute_velocity_similarity(trk_vel, det_vel)
+
+                if self.use_confidence_aware_motion_l15:
+                    motion_reliability_matrix[d, t] = self._compute_l15_motion_reliability(trk, det)
                 
                 if self.use_velocity_trend:
                     trend_matrix[d, t] = compute_velocity_trend_similarity(
@@ -806,37 +828,92 @@ class Tracker:
                 position_matrix[d, t] = np.exp(-dist / 5.0)
         
         
-        combined_matrix = np.zeros((len(detections), len(tracks)))
         track_weights = []
         for trk in tracks:
-            trk_vel = get_velocity(trk)
-            w_vel_t, w_pos_t = compute_adaptive_weight_linear(trk_vel, self.velocity_weight_vmax)
+            if getattr(self, 'l15_use_fixed_motion_position_weights', False):
+                w_vel_t = float(getattr(self, 'l15_fixed_motion_weight', 0.5))
+                w_pos_t = float(getattr(self, 'l15_fixed_position_weight', 0.5))
+                total_w = max(w_vel_t + w_pos_t, 1e-6)
+                w_vel_t = w_vel_t / total_w
+                w_pos_t = w_pos_t / total_w
+            else:
+                trk_vel = get_velocity(trk)
+                w_vel_t, w_pos_t = compute_adaptive_weight_linear(trk_vel, self.velocity_weight_vmax)
             track_weights.append((w_vel_t, w_pos_t))
-        for d in range(len(detections)):
-            for t in range(len(tracks)):
-                w_vel_t, w_pos_t = track_weights[t]
-                base_score = (
-                    w_vel_t * velocity_matrix[d, t] +
-                    w_pos_t * position_matrix[d, t]
-                )
-                if self.use_rotated_geom_in_l15:
-                    rotated_geom_sim = compute_rotated_ground_similarity(
-                        detections[d].bbox,
-                        tracks[t].pose,
+        combined_matrix = self._compute_l15_combined_matrix(
+            velocity_matrix, position_matrix, detections, tracks, track_weights
+        )
+
+        if self.use_confidence_aware_motion_l15:
+            provisional_combined_matrix = combined_matrix.copy()
+            row_top1_indices = np.argmax(provisional_combined_matrix, axis=1) if provisional_combined_matrix.size > 0 else np.array([], dtype=int)
+            row_margins = np.full(len(detections), np.inf, dtype=float)
+            if provisional_combined_matrix.shape[1] > 1:
+                for d in range(len(detections)):
+                    row_scores = provisional_combined_matrix[d]
+                    best_idx = row_top1_indices[d]
+                    second_best = np.max(np.delete(row_scores, best_idx))
+                    row_margins[d] = float(row_scores[best_idx] - second_best)
+
+            for d, det in enumerate(detections):
+                for t, trk in enumerate(tracks):
+                    is_winner_candidate = int(t == row_top1_indices[d]) if row_top1_indices.size > 0 else 0
+                    provisional_score = float(provisional_combined_matrix[d, t])
+                    row_margin = float(row_margins[d]) if is_winner_candidate and np.isfinite(row_margins[d]) else np.nan
+                    raw_vel_sim = float(velocity_matrix[d, t])
+                    effective_vel_sim = raw_vel_sim
+                    suppression_strength = 0.0
+                    suppression_applied = 0
+                    if is_winner_candidate:
+                        suppression_strength = self._compute_l15_selective_suppression_strength(
+                            raw_vel_sim=raw_vel_sim,
+                            motion_reliability=float(motion_reliability_matrix[d, t]),
+                            provisional_score=provisional_score,
+                            row_margin=row_margin,
+                            velocity_threshold=velocity_threshold,
+                        )
+                        if raw_vel_sim > float(self.l15_motion_reliability_neutral):
+                            effective_vel_sim = raw_vel_sim - suppression_strength * (
+                                raw_vel_sim - float(self.l15_motion_reliability_neutral)
+                            )
+                            velocity_matrix[d, t] = effective_vel_sim
+                            suppression_applied = int(
+                                suppression_strength >= float(self.l15_motion_v4_min_effect)
+                            )
+                    self._append_l15_motion_diag_log(
+                        track=trk,
+                        detection=det,
+                        raw_vel_sim=raw_vel_sim,
+                        effective_vel_sim=float(effective_vel_sim),
+                        motion_reliability=float(motion_reliability_matrix[d, t]),
+                        suppression_applied=suppression_applied,
+                        det_local_idx=d,
+                        trk_local_idx=t,
+                        combined_score=None,
+                        row_top1=None,
+                        col_top1=None,
+                        gate_pass=None,
+                        provisional_score=provisional_score,
+                        winner_candidate=is_winner_candidate,
+                        row_margin=row_margin,
+                        suppression_strength=float(suppression_strength),
+                        defer_write=True,
+                        pending_entries=l15_motion_diag_entries,
                     )
-                    geom_w = max(0.0, min(1.0, float(self.rotated_geom_weight_l15)))
-                    base_score = (1.0 - geom_w) * base_score + geom_w * rotated_geom_sim
-                if self.use_state_heading_in_l15:
-                    heading_score = self._compute_state_heading_consistency(
-                        tracks[t], detections[d]
-                    )
-                    heading_mix = max(0.0, min(1.0, 0.5 * (
-                        float(getattr(tracks[t], 'heading_conf_det', 0.5)) +
-                        float(getattr(tracks[t], 'heading_conf_vel', 0.5))
-                    )))
-                    combined_matrix[d, t] = (1.0 - heading_mix) * base_score + heading_mix * heading_score
-                else:
-                    combined_matrix[d, t] = base_score
+
+            combined_matrix = self._compute_l15_combined_matrix(
+                velocity_matrix, position_matrix, detections, tracks, track_weights
+            )
+
+        row_top1_indices = np.argmax(combined_matrix, axis=1) if combined_matrix.size > 0 else np.array([], dtype=int)
+        col_top1_indices = np.argmax(combined_matrix, axis=0) if combined_matrix.size > 0 else np.array([], dtype=int)
+        if l15_motion_diag_entries is not None:
+            for (d, t), entry in l15_motion_diag_entries.items():
+                entry['combined_score'] = float(combined_matrix[d, t])
+                entry['row_top1'] = int(t == row_top1_indices[d])
+                entry['col_top1'] = int(d == col_top1_indices[t])
+                entry['gate_pass'] = int(combined_matrix[d, t] >= velocity_threshold)
+                self._append_l15_motion_diag_log(**entry)
         
         # 4. 匈牙利算法求解
         cost_matrix = -combined_matrix
@@ -1053,3 +1130,178 @@ class Tracker:
         acceleration = (recent_vel - prev_vel) / frame_diff
         
         return acceleration
+
+    def _compute_l15_motion_reliability(self, track, detection):
+        if not getattr(self, 'use_confidence_aware_motion_l15', False):
+            return 1.0
+
+        score = 1.0
+        try:
+            score = float(getattr(detection, 'score', 1.0))
+        except Exception:
+            score = 1.0
+        score = max(0.0, min(1.0, score))
+
+        uncertainty = 0.0
+        try:
+            P = track.kf_3d.kf.P
+            sx = float(np.sqrt(np.abs(P[0, 0]))) if P.shape[0] > 0 else 0.0
+            sz = float(np.sqrt(np.abs(P[2, 2]))) if P.shape[0] > 2 else 0.0
+            uncertainty = max(0.0, min(1.0, (sx + sz) / max(self.velocity_weight_vmax, 1e-6)))
+        except Exception:
+            uncertainty = 0.0
+
+        logit = (
+            float(self.l15_motion_reliability_bias) +
+            float(self.l15_motion_reliability_score_gain) * (score - self.det_thresh) -
+            float(self.l15_motion_reliability_uncertainty_gain) * uncertainty
+        )
+        return float(1.0 / (1.0 + np.exp(-logit)))
+
+    def _compute_l15_combined_matrix(self, motion_matrix, position_matrix, detections, tracks, track_weights):
+        combined_matrix = np.zeros((len(detections), len(tracks)))
+        for d in range(len(detections)):
+            for t in range(len(tracks)):
+                w_vel_t, w_pos_t = track_weights[t]
+                base_score = (
+                    w_vel_t * motion_matrix[d, t] +
+                    w_pos_t * position_matrix[d, t]
+                )
+                if self.use_rotated_geom_in_l15:
+                    rotated_geom_sim = compute_rotated_ground_similarity(
+                        detections[d].bbox,
+                        tracks[t].pose,
+                    )
+                    geom_w = max(0.0, min(1.0, float(self.rotated_geom_weight_l15)))
+                    base_score = (1.0 - geom_w) * base_score + geom_w * rotated_geom_sim
+                if self.use_state_heading_in_l15:
+                    heading_score = self._compute_state_heading_consistency(
+                        tracks[t], detections[d]
+                    )
+                    heading_mix = max(0.0, min(1.0, 0.5 * (
+                        float(getattr(tracks[t], 'heading_conf_det', 0.5)) +
+                        float(getattr(tracks[t], 'heading_conf_vel', 0.5))
+                    )))
+                    combined_matrix[d, t] = (1.0 - heading_mix) * base_score + heading_mix * heading_score
+                else:
+                    combined_matrix[d, t] = base_score
+        return combined_matrix
+
+    def _compute_l15_selective_suppression_strength(
+        self,
+        raw_vel_sim,
+        motion_reliability,
+        provisional_score,
+        row_margin,
+        velocity_threshold,
+    ):
+        high_sim_threshold = float(getattr(self, 'l15_motion_v4_high_sim_threshold', 0.80))
+        raw_focus_gain = float(getattr(self, 'l15_motion_v4_raw_focus_gain', 10.0))
+        gate_focus_gain = float(getattr(self, 'l15_motion_v4_gate_focus_gain', 12.0))
+        margin_center = float(getattr(self, 'l15_motion_v4_margin_center', 0.10))
+        margin_gain = float(getattr(self, 'l15_motion_v4_margin_gain', 20.0))
+        raw_focus = 1.0 / (1.0 + np.exp(-raw_focus_gain * (float(raw_vel_sim) - high_sim_threshold)))
+        gate_focus = 1.0 / (1.0 + np.exp(-gate_focus_gain * (float(provisional_score) - float(velocity_threshold))))
+        if np.isnan(row_margin):
+            ambiguity_focus = 0.0
+        else:
+            ambiguity_focus = 1.0 / (1.0 + np.exp(-margin_gain * (margin_center - float(row_margin))))
+        reliability_risk = max(0.0, min(1.0, 1.0 - float(motion_reliability)))
+        suppression_strength = reliability_risk * raw_focus * gate_focus * ambiguity_focus
+        return float(max(0.0, min(1.0, suppression_strength)))
+
+    def _append_l15_motion_diag_log(
+        self,
+        track,
+        detection,
+        raw_vel_sim,
+        effective_vel_sim,
+        motion_reliability,
+        suppression_applied,
+        det_local_idx=None,
+        trk_local_idx=None,
+        combined_score=None,
+        row_top1=None,
+        col_top1=None,
+        gate_pass=None,
+        provisional_score=None,
+        winner_candidate=None,
+        row_margin=None,
+        suppression_strength=None,
+        defer_write=False,
+        pending_entries=None,
+    ):
+        if not getattr(self, 'enable_l15_motion_diag_log', False):
+            return
+        log_path = getattr(self, 'l15_motion_diag_log_path', None)
+        if not log_path:
+            return
+        try:
+            score = float(getattr(detection, 'score', 1.0))
+        except Exception:
+            score = 1.0
+        uncertainty = 0.0
+        try:
+            P = track.kf_3d.kf.P
+            sx = float(np.sqrt(np.abs(P[0, 0]))) if P.shape[0] > 0 else 0.0
+            sz = float(np.sqrt(np.abs(P[2, 2]))) if P.shape[0] > 2 else 0.0
+            uncertainty = max(0.0, min(1.0, (sx + sz) / max(self.velocity_weight_vmax, 1e-6)))
+        except Exception:
+            uncertainty = 0.0
+        if defer_write:
+            if pending_entries is not None and det_local_idx is not None and trk_local_idx is not None:
+                pending_entries[(int(det_local_idx), int(trk_local_idx))] = {
+                    'track': track,
+                    'detection': detection,
+                    'raw_vel_sim': raw_vel_sim,
+                    'effective_vel_sim': effective_vel_sim,
+                    'motion_reliability': motion_reliability,
+                    'suppression_applied': suppression_applied,
+                    'det_local_idx': det_local_idx,
+                    'trk_local_idx': trk_local_idx,
+                    'combined_score': combined_score,
+                    'row_top1': row_top1,
+                    'col_top1': col_top1,
+                    'gate_pass': gate_pass,
+                    'provisional_score': provisional_score,
+                    'winner_candidate': winner_candidate,
+                    'row_margin': row_margin,
+                    'suppression_strength': suppression_strength,
+                }
+            return
+        try:
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            seq_id = getattr(self.multi_frame_config, 'current_seq_id', 'unknown')
+            curr_frame = getattr(self.multi_frame_config, 'current_data_frame', self.current_frame)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(
+                    '[L1.5 MotionDiag][{}] frame={} track_id={} score={:.6f} uncertainty={:.6f} '
+                    'motion_reliability={:.6f} raw_vel_sim={:.6f} effective_vel_sim={:.6f} '
+                    'suppression_applied={} det_local_idx={} trk_local_idx={} combined_score={} '
+                    'row_top1={} col_top1={} gate_pass={} provisional_score={} '
+                    'winner_candidate={} row_margin={} suppression_strength={}\n'.format(
+                        seq_id,
+                        int(curr_frame) if curr_frame is not None else int(self.current_frame),
+                        int(getattr(track, 'track_id_3d', -1)),
+                        float(score),
+                        float(uncertainty),
+                        float(motion_reliability),
+                        float(raw_vel_sim),
+                        float(effective_vel_sim),
+                        int(suppression_applied),
+                        -1 if det_local_idx is None else int(det_local_idx),
+                        -1 if trk_local_idx is None else int(trk_local_idx),
+                        'nan' if combined_score is None else '{:.6f}'.format(float(combined_score)),
+                        -1 if row_top1 is None else int(row_top1),
+                        -1 if col_top1 is None else int(col_top1),
+                        -1 if gate_pass is None else int(gate_pass),
+                        'nan' if provisional_score is None else '{:.6f}'.format(float(provisional_score)),
+                        -1 if winner_candidate is None else int(winner_candidate),
+                        'nan' if row_margin is None or np.isnan(row_margin) else '{:.6f}'.format(float(row_margin)),
+                        'nan' if suppression_strength is None else '{:.6f}'.format(float(suppression_strength)),
+                    )
+                )
+        except Exception:
+            return
