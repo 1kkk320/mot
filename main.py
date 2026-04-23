@@ -12,6 +12,68 @@ from visualization.visualization_2d import plot_one_box
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
 
+def get_l15_selective_risk_preset():
+    preset_name = os.getenv('L15_RISK_PRESET', 'weaker').strip().lower()
+    presets = {
+        'weaker': {
+            'name': 'weaker',
+            'gate_focus_gain': 7.0,
+            'margin_center': 0.30,
+            'margin_gain': 10.0,
+            'min_effect': 0.01,
+        },
+        'current': {
+            'name': 'current',
+            'gate_focus_gain': 8.0,
+            'margin_center': 0.35,
+            'margin_gain': 10.0,
+            'min_effect': 0.01,
+        },
+        'stronger': {
+            'name': 'stronger',
+            'gate_focus_gain': 9.0,
+            'margin_center': 0.40,
+            'margin_gain': 10.0,
+            'min_effect': 0.01,
+        },
+    }
+    preset = presets.get(preset_name, presets['current']).copy()
+    if preset_name not in presets:
+        print(f"[L1.5 RiskPreset] Unknown preset '{preset_name}', fallback to 'current'")
+    return preset
+
+
+def get_l15_motion_position_weight_preset():
+    # Keep 0.50 / 0.50 as the verified working baseline unless a sweep overrides it.
+    preset_name = os.getenv('L15_WEIGHT_PRESET', 'balanced').strip().lower()
+    presets = {
+        'pos_heavier': {
+            'name': 'pos_heavier',
+            'motion_weight': 0.45,
+            'position_weight': 0.55,
+        },
+        'balanced': {
+            'name': 'balanced',
+            'motion_weight': 0.50,
+            'position_weight': 0.50,
+        },
+        'motion_heavier': {
+            'name': 'motion_heavier',
+            'motion_weight': 0.55,
+            'position_weight': 0.45,
+        },
+        'motion_heaviest': {
+            'name': 'motion_heaviest',
+            'motion_weight': 0.60,
+            'position_weight': 0.40,
+        },
+    }
+    preset = presets.get(preset_name, presets['balanced']).copy()
+    if preset_name not in presets:
+        print(f"[L1.5 WeightPreset] Unknown preset '{preset_name}', fallback to 'balanced'")
+    return preset
+
+
 def is_image_file(filename):
     return any(filename.endswith(extension) for extension in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'])
 
@@ -116,6 +178,8 @@ class DeepFusion(object):
 
 
 def main():
+    l15_risk_preset = get_l15_selective_risk_preset()
+    l15_weight_preset = get_l15_motion_position_weight_preset()
     # Define the file name
     data_root = 'datasets/kitti/train'
     detections_name_3D = '3D_virconv'  
@@ -175,8 +239,8 @@ def main():
     tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
     tracker.tracker.adaptive_weight = True  # 启用自适应速度权重
     tracker.tracker.l15_use_fixed_motion_position_weights = True
-    tracker.tracker.l15_fixed_motion_weight = 0.5
-    tracker.tracker.l15_fixed_position_weight = 0.5
+    tracker.tracker.l15_fixed_motion_weight = l15_weight_preset['motion_weight']
+    tracker.tracker.l15_fixed_position_weight = l15_weight_preset['position_weight']
     tracker.tracker.velocity_weight_vmax = 12.0  # 速度归一化最大值
     tracker.tracker.use_velocity_trend = True  # 启用速度趋势
     tracker.tracker.use_smooth_velocity = True  # 启用速度平滑
@@ -189,13 +253,29 @@ def main():
     tracker.tracker.l15_motion_reliability_neutral = 0.5
     tracker.tracker.l15_motion_v4_high_sim_threshold = 0.8
     tracker.tracker.l15_motion_v4_raw_focus_gain = 10.0
-    tracker.tracker.l15_motion_v4_gate_focus_gain = 8.0
-    tracker.tracker.l15_motion_v4_margin_center = 0.35
-    tracker.tracker.l15_motion_v4_margin_gain = 10.0
-    tracker.tracker.l15_motion_v4_min_effect = 0.01
+    tracker.tracker.l15_motion_v4_gate_focus_gain = l15_risk_preset['gate_focus_gain']
+    tracker.tracker.l15_motion_v4_margin_center = l15_risk_preset['margin_center']
+    tracker.tracker.l15_motion_v4_margin_gain = l15_risk_preset['margin_gain']
+    tracker.tracker.l15_motion_v4_min_effect = l15_risk_preset['min_effect']
     tracker.tracker.enable_l15_motion_diag_log = True
     tracker.tracker.l15_motion_diag_log_path = os.path.join(
-        'logs', 'l15_motion_diag.log'
+        'logs', f"l15_motion_diag_{l15_risk_preset['name']}_{l15_weight_preset['name']}.log"
+    )
+    print(
+        "[L1.5 WeightPreset] name={} motion_weight={} position_weight={}".format(
+            l15_weight_preset['name'],
+            tracker.tracker.l15_fixed_motion_weight,
+            tracker.tracker.l15_fixed_position_weight,
+        )
+    )
+    print(
+        "[L1.5 RiskPreset] name={} gate_focus_gain={} margin_center={} margin_gain={} min_effect={}".format(
+            l15_risk_preset['name'],
+            tracker.tracker.l15_motion_v4_gate_focus_gain,
+            tracker.tracker.l15_motion_v4_margin_center,
+            tracker.tracker.l15_motion_v4_margin_gain,
+            tracker.tracker.l15_motion_v4_min_effect,
+        )
     )
     
     # ========== 基线：关闭 L2.5 多帧回溯 ==========
