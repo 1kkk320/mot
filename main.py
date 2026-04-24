@@ -74,6 +74,36 @@ def get_l15_motion_position_weight_preset():
     return preset
 
 
+def get_l12_defer_preset():
+    preset_name = os.getenv('L12_DEFER_PRESET', 'current').strip().lower()
+    presets = {
+        'current': {
+            'name': 'current',
+            'defer_threshold': 0.16,
+            'identity_floor': 0.60,
+        },
+        'mild': {
+            'name': 'mild',
+            'defer_threshold': 0.14,
+            'identity_floor': 0.62,
+        },
+        'moderate': {
+            'name': 'moderate',
+            'defer_threshold': 0.12,
+            'identity_floor': 0.64,
+        },
+    }
+    preset = presets.get(preset_name, presets['current']).copy()
+    if preset_name not in presets:
+        print(f"[L1 DeferPreset] Unknown preset '{preset_name}', fallback to 'current'")
+    return preset
+def get_tracker_output_name(data_root):
+    parts = set(os.path.normpath(data_root).split(os.sep))
+    if 'test' in parts or 'testing' in parts:
+        return 'virconv_OCM_test'
+    return 'virconv_OCM'
+
+
 def is_image_file(filename):
     return any(filename.endswith(extension) for extension in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'])
 
@@ -129,10 +159,18 @@ class DeepFusion(object):
 
         self.frame_count += 1
         outputs = []
+        output_meta = []
         for track in self.tracker.tracks_3d:
             if track.is_confirmed():
                 bbox = np.array(track.pose[self.reorder_back])
                 outputs.append(np.concatenate(([track.track_id_3d], bbox, track.additional_info)).reshape(1, -1))
+                output_meta.append({
+                    'track_id': int(track.track_id_3d),
+                    'assoc_level': str(getattr(track, 'last_assoc_level', 'UNKNOWN')),
+                    'assoc_frame': int(getattr(track, 'last_assoc_frame', -1)),
+                    'time_since_update': int(getattr(track, 'time_since_update', -1)),
+                    'hits': int(getattr(track, 'hits', -1)),
+                })
         if len(outputs) > 0:
             outputs = np.stack(outputs, axis=0)
             # print(outputs)
@@ -148,7 +186,7 @@ class DeepFusion(object):
             # print("2d轨迹",outputs_2d,type(outputs_2d))
 
 
-        return outputs,outputs_2d
+        return outputs, outputs_2d, output_meta
 
     @staticmethod
     def _xywh_to_tlwh(bbox_xywh):  # Convert the coordinate format of the bbox box from center x, y, w, h to upper left x, upper left y, w, h
@@ -180,8 +218,9 @@ class DeepFusion(object):
 def main():
     l15_risk_preset = get_l15_selective_risk_preset()
     l15_weight_preset = get_l15_motion_position_weight_preset()
+    l12_defer_preset = get_l12_defer_preset()
     # Define the file name
-    data_root = 'datasets/kitti/train'
+    data_root = 'datasets/kitti/test'
     detections_name_3D = '3D_virconv'  
     detections_name_2D = '2D_rrc_Car'  
 
@@ -190,9 +229,12 @@ def main():
     dataset_dir = os.path.join(data_root,'image_02')
     detections_root_3D = os.path.join(data_root, detections_name_3D)
     detections_root_2D = os.path.join(data_root, detections_name_2D)
-    save_root = r'E:\mot\results\virconv_OCM'
+    parts = set(os.path.normpath(data_root).split(os.sep))
+    tracker_output_name = get_tracker_output_name(data_root)
+    save_root = os.path.join(r'E:\mot\results', tracker_output_name)
     txt_path_0 = os.path.join(save_root, 'data'); mkdir_if_inexistence(txt_path_0)
     image_path_0 = os.path.join(save_root, 'image'); mkdir_if_inexistence(image_path_0)
+    assoc_diag_path_0 = os.path.join(save_root, 'assoc_levels'); mkdir_if_inexistence(assoc_diag_path_0)
     # Open file to save in list.打开保存在列表里面的文件
     det_id2str = {1: 'Pedestrian', 2: 'Car', 3: 'Cyclist'}
     calib_files = os.listdir(calib_root) #返回指定的文件夹包含的文件或文件夹的名字的列表。
@@ -205,7 +247,6 @@ def main():
     image_file_list, _ = load_list_from_folder(image_files, dataset_dir)
 
     # Pre-create empty result files for evaluator/consistency
-    parts = set(os.path.normpath(data_root).split(os.sep))
     if 'train' in parts or 'training' in parts:
         all_train_seqs = [f"{i:04d}" for i in range(21)]
         for name in all_train_seqs:
@@ -225,10 +266,43 @@ def main():
     tracker.tracker.use_rotated_geom_in_l2 = True
     tracker.tracker.use_rotated_geom_in_l15 = True
     tracker.tracker.rotated_geom_weight_l15 = 0.20
+    tracker.tracker.enable_l12_risk_model = True
+    tracker.tracker.enable_l12_risk_tempering = False
+    tracker.tracker.enable_l1_deferred_commitment = True
+    tracker.tracker.enable_l2_deferred_commitment = False
+    tracker.tracker.enable_l12_defer_diag_log = True
+    tracker.tracker.l12_defer_diag_log_path = os.path.join('logs', 'l12_defer_diag.log')
+    tracker.tracker.l12_risk_margin_center = 0.08
+    tracker.tracker.l12_risk_app_rescue = 0.06
+    tracker.tracker.l12_defer_threshold = l12_defer_preset['defer_threshold']
+    tracker.tracker.l12_defer_identity_floor = l12_defer_preset['identity_floor']
     print('[Association Config] RotGeom(L1={}, L2={})'.format(
         tracker.tracker.use_rotated_geom_in_l1,
         tracker.tracker.use_rotated_geom_in_l2,
     ))
+    print(
+        '[L1/L2 RiskModel] enabled={} tempering={} defer_l1={} defer_l2={} margin_center={}'.format(
+            tracker.tracker.enable_l12_risk_model,
+            tracker.tracker.enable_l12_risk_tempering,
+            tracker.tracker.enable_l1_deferred_commitment,
+            tracker.tracker.enable_l2_deferred_commitment,
+            tracker.tracker.l12_risk_margin_center,
+        )
+    )
+    print(
+        '[L1 DeferDiag] enabled={} path={}'.format(
+            tracker.tracker.enable_l12_defer_diag_log,
+            tracker.tracker.l12_defer_diag_log_path,
+        )
+    )
+    print(
+        '[L1 DeferPreset] name={} defer_threshold={} identity_floor={}'.format(
+            l12_defer_preset['name'],
+            tracker.tracker.l12_defer_threshold,
+            tracker.tracker.l12_defer_identity_floor,
+        )
+    )
+    print('[Output] tracker_name={} save_root={}'.format(tracker_output_name, save_root))
 
     # 优化速度自适应参数
     tracker.tracker.adaptive_threshold_low = 0.40  # 0.40
@@ -291,10 +365,8 @@ def main():
     tracker.tracker.multi_frame_config.appearance_hard_gate = 0.50  # 外观硬门控
     tracker.tracker.multi_frame_config.verbose = False  # 关闭调试输出
     tracker.tracker.multi_frame_config.use_l25_memory_bank_appearance = False
-    tracker.tracker.multi_frame_config.use_state_heading_in_l25 = False
     tracker.tracker.multi_frame_config.use_rotated_geom_in_l25 = False
     tracker.tracker.multi_frame_config.rotated_geom_weight_l25 = 0.10
-    tracker.tracker.multi_frame_config.state_heading_sigma = 0.45
     tracker.tracker.multi_frame_config.memory_bank_size = 3
     tracker.tracker.multi_frame_config.memory_bank_min_conf = 0.4
     tracker.tracker.multi_frame_config.memory_bank_rescore_margin = 0.03
@@ -303,6 +375,14 @@ def main():
     tracker.tracker.multi_frame_config.candidate_min_size_ratio = 0.55
     tracker.tracker.multi_frame_config.candidate_max_center_dist_base = 2.0
     tracker.tracker.multi_frame_config.candidate_max_center_dist_per_dt = 0.35
+    print(
+        '[L4 Handover] tempered={} hits_center={} age_center={} score_threshold={}'.format(
+            tracker.tracker.enable_l4_identity_tempering,
+            tracker.tracker.l4_handover_hits_center,
+            tracker.tracker.l4_handover_age_center,
+            tracker.tracker.l4_handover_score_threshold,
+        )
+    )
     
     # ========== 基线：关闭加速度门控 ==========
     tracker.tracker.multi_frame_config.enable_l25_cooldown = False
@@ -315,6 +395,8 @@ def main():
     tracker.tracker.embedding_off = False  # 保持外观特征提取
     if tracker.tracker.enable_l15_motion_diag_log:
         open(tracker.tracker.l15_motion_diag_log_path, 'w', encoding='utf-8').close()
+    if tracker.tracker.enable_l12_defer_diag_log:
+        open(tracker.tracker.l12_defer_diag_log_path, 'w', encoding='utf-8').close()
     
     # Iterate through each data set 遍历数据集
     for seq_file_3D in detection_file_list_3D:
@@ -335,7 +417,10 @@ def main():
             continue
         txt_path = txt_path_0 + "\\" + seq_id + '.txt'
         image_path = image_path_0 + '\\' + seq_id; mkdir_if_inexistence(image_path)
+        assoc_diag_path = assoc_diag_path_0 + "\\" + seq_id + '.csv'
         open(txt_path, 'w').close()
+        with open(assoc_diag_path, 'w', encoding='utf-8') as f_assoc:
+            f_assoc.write('frame,track_id,assoc_level,assoc_frame,time_since_update,hits\n')
         tracker.tracker.velocity_weight_vmax = 10.0
         tracker.tracker.adaptive_threshold_low = 0.55
         tracker.tracker.adaptive_threshold_mid = 0.60
@@ -392,7 +477,7 @@ def main():
             detection_2D_only_tlwh = np.array([convert_x1y1x2y2_to_tlwh(i) for i in detection_2D_only]) # (x1,y1,x2,y2) to (x,y,center_x,center_y)
 
             start_time = time.time()
-            trackers,trackers_2d = tracker.update(detection_3D_fusion, detection_2D_only_tlwh, detection_3D_only, detection_3Dto2D_only,
+            trackers,trackers_2d,trackers_meta = tracker.update(detection_3D_fusion, detection_2D_only_tlwh, detection_3D_only, detection_3Dto2D_only,
                                       additional_info, calib_file_seq,img_0, detection_2D_only_conf, detection_3D_fusion_conf)
             cycle_time = time.time() - start_time
             total_time += cycle_time
@@ -405,7 +490,7 @@ def main():
 
             img_vis = img_0.copy()
             if len(trackers) > 0:
-                for d in trackers:
+                for meta_idx, d in enumerate(trackers):
                     bbox3d = d.flatten()
                     bbox3d_tmp = bbox3d[1:8]  # 3D bounding box(h,w,l,x,y,z,theta)
                     id_tmp = int(bbox3d[0])
@@ -426,6 +511,19 @@ def main():
                             f"{conf_tmp:.6f}\n"
                         )
                         f.write(str_to_srite)
+                    if meta_idx < len(trackers_meta):
+                        meta = trackers_meta[meta_idx]
+                        with open(assoc_diag_path, 'a', encoding='utf-8') as f_assoc:
+                            f_assoc.write(
+                                '{},{},{},{},{},{}\n'.format(
+                                    int(frame),
+                                    int(meta.get('track_id', id_tmp)),
+                                    str(meta.get('assoc_level', 'UNKNOWN')),
+                                    int(meta.get('assoc_frame', -1)),
+                                    int(meta.get('time_since_update', -1)),
+                                    int(meta.get('hits', -1)),
+                                )
+                            )
                         #show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
             #if len(trackers_2d) > 0:
                 #for d in trackers_2d:
@@ -454,6 +552,11 @@ def main():
     print('============== 轨迹恢复统计 ==============')
     print(f'L1.5 (速度回溯) 总恢复: {tracker.tracker.total_L15_recoveries}')
     print(f'L2.5 (多帧回溯) 总恢复: {tracker.tracker.total_L25_recoveries}')
+    print(f'L1 defer 总延迟对数: {tracker.tracker.total_l12_deferred_pairs}')
+    print(f'L1 defer 后被 L1.5 接回: {tracker.tracker.total_l12_deferred_recovered_l15}')
+    print(f'L4 总匹配: {tracker.tracker.total_l4_matches}')
+    print(f'L4 身份接管: {tracker.tracker.total_l4_id_takeovers}')
+    print(f'L4 仅救回不接管: {tracker.tracker.total_l4_id_kept}')
     print('===========================================')
     
     # Per-level timing summary

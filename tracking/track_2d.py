@@ -36,6 +36,20 @@ class Track_2D:
         self.confidence = 0.97
         self.con1 = 0.96
         self.emb = emb
+        self.last_assoc_level = 'INIT'
+        self.last_assoc_frame = -1
+
+    def set_assoc_source(self, level, frame):
+        if level is None:
+            return
+        try:
+            self.last_assoc_level = str(level)
+        except Exception:
+            self.last_assoc_level = 'UNKNOWN'
+        try:
+            self.last_assoc_frame = int(frame)
+        except Exception:
+            pass
     def to_tlwh(self):
         """
         Get current position in bounding box format `(top left x, top left y, width, height)`.

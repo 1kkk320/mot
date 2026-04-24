@@ -68,8 +68,6 @@ class MultiFrameBacktrackConfig:
         self.candidate_min_size_ratio = 0.55
         self.candidate_max_center_dist_base = 2.0
         self.candidate_max_center_dist_per_dt = 0.35
-        self.use_state_heading_in_l25 = False
-        self.state_heading_sigma = 0.45
         self.use_rotated_geom_in_l25 = False
         self.rotated_geom_weight_l25 = 0.10
         self.use_l25_memory_bank_appearance = False
@@ -485,56 +483,6 @@ def _build_l25_cost(iou, vel_sim, app_sim, track, config, w_vel_t, uncertainty, 
     combined_sim = w_iou * iou + w_vel * vel_sim + w_app * app_sim
     return float(-(combined_sim * decay))
 
-
-def _wrap_to_pi(angle):
-    return math.atan2(math.sin(angle), math.cos(angle))
-
-
-def _compute_l25_heading_consistency(track, detection, det_vel, dt, config):
-    if config is None or not getattr(config, 'use_state_heading_in_l25', False):
-        return None
-    try:
-        track_heading = float(track.get_predicted_heading(float(dt))) if hasattr(track, 'get_predicted_heading') else float(track.pose[3])
-    except Exception:
-        return None
-
-    obs_angles = []
-    obs_weights = []
-    try:
-        det_heading = float(detection.bbox[3])
-        det_conf = float(getattr(track, 'heading_conf_det', 0.5))
-        obs_angles.append(det_heading)
-        obs_weights.append(max(det_conf, 1e-3))
-    except Exception:
-        pass
-
-    try:
-        if det_vel is not None:
-            vx = float(det_vel[0])
-            vz = float(det_vel[2])
-            vel_heading = math.atan2(vz, vx + 1e-6)
-            speed = math.sqrt(vx * vx + vz * vz)
-            vel_conf = (1.0 - math.exp(-speed / 3.0)) * max(float(getattr(track, 'heading_conf_vel', 0.5)), 1e-3)
-            obs_angles.append(vel_heading)
-            obs_weights.append(max(vel_conf, 1e-3))
-    except Exception:
-        pass
-
-    if len(obs_angles) == 0:
-        return None
-
-    s = 0.0
-    c = 0.0
-    for ang, w in zip(obs_angles, obs_weights):
-        s += w * math.sin(ang)
-        c += w * math.cos(ang)
-    fused_obs = math.atan2(s, c) if (abs(s) > 1e-8 or abs(c) > 1e-8) else obs_angles[0]
-
-    delta = _wrap_to_pi(track_heading - fused_obs)
-    sigma = max(float(getattr(config, 'state_heading_sigma', 0.45)), 1e-3)
-    return float(math.exp(-0.5 * (delta / sigma) ** 2))
-
-
 def _passes_l25_candidate_pre_gate(rollback_pose, det_bbox, iou, dt, config):
     if config is None or not getattr(config, 'enable_candidate_pre_gate', True):
         return True
@@ -625,13 +573,6 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
             det_vel = estimate_detection_velocity(det, detection_buffer, fid)
             trk_vel = get_velocity(track)
             vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
-            heading_consistency = _compute_l25_heading_consistency(track, det, det_vel, dt, config)
-            if heading_consistency is not None:
-                heading_mix = max(0.0, min(1.0, 0.5 * (
-                    float(getattr(track, 'heading_conf_det', 0.5)) +
-                    float(getattr(track, 'heading_conf_vel', 0.5))
-                )))
-                vel_sim = (1.0 - heading_mix) * vel_sim + heading_mix * heading_consistency
             # 外观上限：短遮挡/长遮挡
             cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
             base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
@@ -755,13 +696,6 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                 det_vel = estimate_detection_velocity(det, detection_buffer, fid)
                 trk_vel = get_velocity(track)
                 vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
-                heading_consistency = _compute_l25_heading_consistency(track, det, det_vel, dt, config)
-                if heading_consistency is not None:
-                    heading_mix = max(0.0, min(1.0, 0.5 * (
-                        float(getattr(track, 'heading_conf_det', 0.5)) +
-                        float(getattr(track, 'heading_conf_vel', 0.5))
-                    )))
-                    vel_sim = (1.0 - heading_mix) * vel_sim + heading_mix * heading_consistency
                 vmax = getattr(config, 'vmax_for_adaptive_weight', 10.0)
                 w_vel_t, _ = compute_adaptive_weight_linear(get_velocity(track), v_max=vmax)
                 uncertainty = 0.0

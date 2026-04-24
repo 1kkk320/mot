@@ -5,42 +5,6 @@ import math
 from tracking.cost_function import iou3d, convert_3dbox_to_8corner, iou_batch, eucliDistance
 import scipy.spatial as sp
 
-
-def wrap_to_pi(angle):
-    return math.atan2(math.sin(angle), math.cos(angle))
-
-
-def extract_track_heading(track):
-    try:
-        if hasattr(track, 'fused_heading'):
-            return float(track.fused_heading)
-    except Exception:
-        pass
-    try:
-        if hasattr(track, 'pose') and track.pose is not None and len(track.pose) >= 4:
-            return float(track.pose[3])
-    except Exception:
-        pass
-    return None
-
-
-def extract_detection_heading(detection):
-    try:
-        if hasattr(detection, 'bbox') and detection.bbox is not None and len(detection.bbox) >= 4:
-            return float(detection.bbox[3])
-    except Exception:
-        pass
-    return None
-
-
-def compute_heading_consistency(track_heading, det_heading, sigma=0.45):
-    if track_heading is None or det_heading is None:
-        return 0.5
-    delta = wrap_to_pi(track_heading - det_heading)
-    sigma = max(float(sigma), 1e-3)
-    return float(math.exp(-0.5 * (delta / sigma) ** 2))
-
-
 def compute_rotated_ground_similarity(det_box, trk_box, det_corners=None, trk_corners=None):
     """
     Continuous ground-plane geometric similarity using the existing 3D boxes.
@@ -75,27 +39,190 @@ def compute_rotated_ground_similarity(det_box, trk_box, det_corners=None, trk_co
         return 0.0
 
 
-def compute_heading_distance(track_heading, det_heading, metric='symmetric'):
-    if track_heading is None or det_heading is None:
+def _safe_sigmoid(x):
+    x = np.clip(x, -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _compute_track_uncertainty(track, uncertainty_norm=12.0):
+    try:
+        P = track.kf_3d.kf.P
+        sx = float(np.sqrt(np.abs(P[0, 0]))) if P.shape[0] > 0 else 0.0
+        sz = float(np.sqrt(np.abs(P[2, 2]))) if P.shape[0] > 2 else 0.0
+        return float(np.clip((sx + sz) / max(float(uncertainty_norm), 1e-6), 0.0, 1.0))
+    except Exception:
         return 0.0
 
-    delta = wrap_to_pi(track_heading - det_heading)
 
-    if metric == 'cosine':
-        return 0.5 * (1.0 - math.cos(delta))
-
-    # symmetric: theta and theta + pi are treated as equivalent
-    symmetric_delta = math.acos(np.clip(abs(math.cos(delta)), 0.0, 1.0))
-    return symmetric_delta / (math.pi / 2.0)
+def _top2_margin(valid_scores):
+    if valid_scores.size <= 1:
+        return np.nan
+    sorted_scores = np.sort(valid_scores)[::-1]
+    return float(sorted_scores[0] - sorted_scores[1])
 
 
-def _update_heading_stats(stats, **kwargs):
-    if stats is None:
-        return
-    for key, value in kwargs.items():
-        stats[key] = stats.get(key, 0) + value
+def compute_association_risk_context(
+    score_matrix,
+    candidate_mask,
+    detections,
+    trackers,
+    emb_cost=None,
+    risk_options=None,
+):
+    valid_mask = candidate_mask.astype(bool)
+    pair_risk = np.zeros_like(score_matrix, dtype=np.float32)
+    identity_support = np.full_like(score_matrix, 0.5, dtype=np.float32)
+    row_ambiguity = np.zeros((score_matrix.shape[0],), dtype=np.float32)
+    col_ambiguity = np.zeros((score_matrix.shape[1],), dtype=np.float32)
+    is_active = False
+    if risk_options is not None:
+        is_active = bool(risk_options.get('enabled', False)) or bool(risk_options.get('enable_tempering', False)) or bool(risk_options.get('enable_deferral', False))
+    if not is_active or not np.any(valid_mask):
+        return pair_risk, identity_support, row_ambiguity, col_ambiguity
+
+    risk_center = float(risk_options.get('margin_center', 0.08))
+    risk_gain = float(risk_options.get('margin_gain', 18.0))
+    score_center = float(risk_options.get('score_center', 0.45))
+    score_gain = float(risk_options.get('score_gain', 8.0))
+    tsu_center = float(risk_options.get('tsu_center', 1.5))
+    tsu_gain = float(risk_options.get('tsu_gain', 3.0))
+    beta_center = float(risk_options.get('beta_center', 0.55))
+    beta_gain = float(risk_options.get('beta_gain', 8.0))
+    uncertainty_center = float(risk_options.get('uncertainty_center', 0.25))
+    uncertainty_gain = float(risk_options.get('uncertainty_gain', 8.0))
+    uncertainty_norm = float(risk_options.get('uncertainty_norm', 12.0))
+    temper_strength = float(risk_options.get('temper_strength', 0.20))
+    app_support_center = float(risk_options.get('app_support_center', 0.55))
+    app_support_gain = float(risk_options.get('app_support_gain', 10.0))
+    app_rescue = float(risk_options.get('app_rescue', 0.06))
+
+    for d in range(score_matrix.shape[0]):
+        valid_scores = score_matrix[d, valid_mask[d]]
+        margin = _top2_margin(valid_scores)
+        if np.isnan(margin):
+            row_ambiguity[d] = 0.0
+        else:
+            row_ambiguity[d] = float(_safe_sigmoid(risk_gain * (risk_center - margin)))
+
+    for t in range(score_matrix.shape[1]):
+        valid_scores = score_matrix[valid_mask[:, t], t]
+        margin = _top2_margin(valid_scores)
+        if np.isnan(margin):
+            col_ambiguity[t] = 0.0
+        else:
+            col_ambiguity[t] = float(_safe_sigmoid(risk_gain * (risk_center - margin)))
+
+    det_risk = np.zeros((score_matrix.shape[0],), dtype=np.float32)
+    for d, det in enumerate(detections):
+        try:
+            det_score = float(getattr(det, 'score', 1.0))
+        except Exception:
+            det_score = 1.0
+        det_score = float(np.clip(det_score, 0.0, 1.0))
+        det_risk[d] = float(_safe_sigmoid(score_gain * (score_center - det_score)))
+
+    trk_risk = np.zeros((score_matrix.shape[1],), dtype=np.float32)
+    for t, trk in enumerate(trackers):
+        tsu = float(max(0, int(getattr(trk, 'time_since_update', 0))))
+        beta = float(np.clip(getattr(trk, 'beta_t', 1.0), 0.0, 1.0))
+        uncertainty = _compute_track_uncertainty(trk, uncertainty_norm=uncertainty_norm)
+        tsu_risk = float(_safe_sigmoid(tsu_gain * (tsu - tsu_center)))
+        beta_risk = float(_safe_sigmoid(beta_gain * (beta_center - beta)))
+        uncertainty_risk = float(_safe_sigmoid(uncertainty_gain * (uncertainty - uncertainty_center)))
+        trk_risk[t] = float(np.clip(
+            0.25 * tsu_risk + 0.35 * beta_risk + 0.40 * uncertainty_risk,
+            0.0,
+            1.0,
+        ))
+
+    for d in range(score_matrix.shape[0]):
+        for t in range(score_matrix.shape[1]):
+            if not valid_mask[d, t]:
+                continue
+            ambiguity = max(float(row_ambiguity[d]), float(col_ambiguity[t]))
+            context_risk = 0.55 * float(trk_risk[t]) + 0.45 * float(det_risk[d])
+            pair_risk[d, t] = float(np.clip(ambiguity * context_risk, 0.0, 1.0))
+
+    if emb_cost is not None and emb_cost.shape == score_matrix.shape:
+        identity_support = _safe_sigmoid(app_support_gain * (emb_cost - app_support_center)).astype(np.float32)
+    return pair_risk, identity_support, row_ambiguity, col_ambiguity
 
 
+def apply_association_risk_tempering(
+    score_matrix,
+    pair_risk,
+    identity_support,
+    risk_options=None,
+):
+    if risk_options is None or not risk_options.get('enable_tempering', False):
+        return score_matrix
+
+    temper_strength = float(risk_options.get('temper_strength', 0.20))
+    app_rescue = float(risk_options.get('app_rescue', 0.06))
+    score_matrix = score_matrix.copy()
+    attenuation = temper_strength * pair_risk * (1.0 - identity_support)
+    score_matrix = score_matrix * (1.0 - attenuation)
+    score_matrix = score_matrix + app_rescue * pair_risk * identity_support
+    return score_matrix
+
+
+def apply_deferred_commitment(
+    matched_indices,
+    score_matrix,
+    candidate_mask,
+    pair_risk,
+    identity_support,
+    row_ambiguity,
+    col_ambiguity,
+    options=None,
+):
+    diagnostics = {
+        'initial_match_count': int(matched_indices.shape[0]) if matched_indices.ndim == 2 else 0,
+        'final_match_count': int(matched_indices.shape[0]) if matched_indices.ndim == 2 else 0,
+        'deferred_pairs': [],
+        'deferred_det_indices': [],
+        'deferred_trk_indices': [],
+    }
+    if options is None or not options.get('enable_deferral', False) or matched_indices.size == 0:
+        return matched_indices, diagnostics
+
+    score_center = float(options.get('defer_score_center', 0.25))
+    score_gain = float(options.get('defer_score_gain', 10.0))
+    ambiguity_center = float(options.get('defer_ambiguity_center', 0.55))
+    ambiguity_gain = float(options.get('defer_ambiguity_gain', 10.0))
+    defer_threshold = float(options.get('defer_threshold', 0.16))
+    identity_floor = float(options.get('identity_floor', 0.60))
+
+    kept_matches = []
+    for m in matched_indices:
+        d, t = int(m[0]), int(m[1])
+        if candidate_mask[d, t] == 0:
+            continue
+        ambiguity = max(float(row_ambiguity[d]), float(col_ambiguity[t]))
+        score_focus = float(_safe_sigmoid(score_gain * (float(score_matrix[d, t]) - score_center)))
+        ambiguity_focus = float(_safe_sigmoid(ambiguity_gain * (ambiguity - ambiguity_center)))
+        defer_strength = float(pair_risk[d, t]) * ambiguity_focus * score_focus * (1.0 - float(identity_support[d, t]))
+        if defer_strength >= defer_threshold and float(identity_support[d, t]) < identity_floor:
+            diagnostics['deferred_pairs'].append({
+                'det_idx': d,
+                'trk_idx': t,
+                'score': float(score_matrix[d, t]),
+                'pair_risk': float(pair_risk[d, t]),
+                'ambiguity': float(ambiguity),
+                'identity_support': float(identity_support[d, t]),
+                'defer_strength': float(defer_strength),
+            })
+            diagnostics['deferred_det_indices'].append(d)
+            diagnostics['deferred_trk_indices'].append(t)
+            continue
+        kept_matches.append(m.reshape(1, 2))
+
+    if len(kept_matches) == 0:
+        diagnostics['final_match_count'] = 0
+        return np.empty((0, 2), dtype=int), diagnostics
+    kept_matches = np.concatenate(kept_matches, axis=0)
+    diagnostics['final_match_count'] = int(kept_matches.shape[0])
+    return kept_matches, diagnostics
 def split_cosine_dist(dets, trks, affinity_thresh=0.50, pair_diff_thresh=0.6, hard_thresh=True):
 
     cos_dist = np.zeros((len(dets), len(trks)))
@@ -249,7 +376,20 @@ def associate_detections_to_tracks(tracks, detections, threshold, aw_off, grid_o
         matches = np.concatenate(matches, axis=0)
 
     return matches, np.array(unmatched_trackers), np.array(unmatched_detections)
-def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_off, mot_off, iou_threshold, det_embs=None, det_app=False, appearance_weight=None, heading_options=None):
+def associate_detections_to_trackers_fusion(
+    detections,
+    trackers,
+    aw_off,
+    grid_off,
+    mot_off,
+    iou_threshold,
+    det_embs=None,
+    det_app=False,
+    appearance_weight=None,
+    use_rotated_geom=False,
+    risk_options=None,
+    return_diagnostics=False,
+):
     """
     Baseline 3D association.
     """
@@ -265,7 +405,17 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
     if len(trks_8corner) > 0:
         trks_8corner = np.stack(trks_8corner, axis=0)
 
+    diagnostics = {
+        'initial_match_count': 0,
+        'final_match_count': 0,
+        'deferred_pairs': [],
+        'deferred_det_indices': [],
+        'deferred_trk_indices': [],
+    }
+
     if len(trks_8corner) == 0:
+        if return_diagnostics:
+            return np.empty((0, 2), dtype=int), np.arange(len(dets_8corner)), np.empty((0,), dtype=int), diagnostics
         return np.empty((0, 2), dtype=int), np.arange(len(dets_8corner)), np.empty((0,), dtype=int)
 
     iou_matrix = np.zeros((len(dets_8corner), len(trks_8corner)), dtype=np.float32)
@@ -329,68 +479,30 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
         betas = np.array([max(1e-6, float(getattr(trk, 'beta_t', 1.0))) for trk in trackers], dtype=np.float32)
         dist_thr_vec = (base_dist / np.sqrt(betas)).astype(np.float32)
 
-    heading_options = heading_options or {}
-    heading_rescore_enabled = bool(heading_options.get('enabled', False))
-    heading_enabled = heading_rescore_enabled or bool(heading_options.get('pre_gate_enabled', False))
-    state_heading_enabled = bool(heading_options.get('use_state_heading', False))
-    heading_metric = heading_options.get('metric', 'symmetric')
-    heading_weight = float(heading_options.get('weight', 0.20))
-    heading_margin = float(heading_options.get('ambiguity_margin', 0.03))
-    heading_pre_gate_enabled = bool(heading_options.get('pre_gate_enabled', False))
-    heading_pre_gate_threshold = float(heading_options.get('pre_gate_threshold', 0.55))
-    heading_hard_gate_threshold = float(heading_options.get('hard_gate_threshold', 0.45))
-    heading_stats = heading_options.get('stats')
-    state_heading_sigma = float(heading_options.get('state_heading_sigma', 0.45))
-    rotated_geom_enabled = bool(heading_options.get('use_rotated_geom', False))
-
-    if heading_enabled:
-        _update_heading_stats(heading_stats, calls=1)
-
     if min(iou_matrix.shape) > 0:
         candidate_mask = (iou_matrix > thr_vec.reshape(1, -1)).astype(np.int32) if thr_vec is not None else (iou_matrix > iou_threshold).astype(np.int32)
         if dist_thr_vec is not None and dist_matrix is not None:
             candidate_mask = (candidate_mask & (dist_matrix <= dist_thr_vec.reshape(1, -1))).astype(np.int32)
-        baseline_candidate_mask = candidate_mask.copy()
-
-        if heading_enabled and heading_pre_gate_enabled and candidate_mask.any():
-            pre_gate_mask = np.zeros_like(candidate_mask, dtype=bool)
-            for det_idx, trk_idx in zip(*np.where(candidate_mask > 0)):
-                det_heading = extract_detection_heading(detections[det_idx])
-                trk_heading = extract_track_heading(trackers[trk_idx])
-                heading_dist = compute_heading_distance(
-                    trk_heading,
-                    det_heading,
-                    metric=heading_metric
-                )
-                if heading_dist >= heading_pre_gate_threshold:
-                    pre_gate_mask[det_idx, trk_idx] = True
-            if pre_gate_mask.any():
-                candidate_mask = candidate_mask.copy()
-                candidate_mask[pre_gate_mask] = 0
-                _update_heading_stats(
-                    heading_stats,
-                    pre_gate_suppressed_pairs=int(pre_gate_mask.sum())
-                )
 
         if candidate_mask.sum(1).max() == 1 and candidate_mask.sum(0).max() == 1:
             matched_indices = np.stack(np.where(candidate_mask), axis=1)
         else:
             score_matrix = iou_matrix.copy()
-            if rotated_geom_enabled and len(detections) > 0 and len(trackers) > 0:
-                rotated_geom_matrix = np.zeros_like(score_matrix, dtype=np.float32)
+            if use_rotated_geom and len(detections) > 0 and len(trackers) > 0:
+                geom_matrix = np.zeros_like(score_matrix, dtype=np.float32)
                 for d_idx, det in enumerate(detections):
                     det_box = getattr(det, 'bbox', None)
                     det_corners = dets_8corner[d_idx]
                     for t_idx, trk in enumerate(trackers):
                         trk_box = getattr(trk, 'pose', None)
                         trk_corners = trks_8corner[t_idx]
-                        rotated_geom_matrix[d_idx, t_idx] = compute_rotated_ground_similarity(
+                        geom_matrix[d_idx, t_idx] = compute_rotated_ground_similarity(
                             det_box,
                             trk_box,
                             det_corners=det_corners,
                             trk_corners=trk_corners,
                         )
-                score_matrix = rotated_geom_matrix
+                score_matrix = geom_matrix
             if not det_app and emb_cost is not None and emb_cost.size > 0:
                 if not aw_off:
                     w_matrix = compute_aw_new_metric(emb_cost, w_assoc_emb, aw_param)
@@ -400,137 +512,36 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
                 w_app = min(max(appearance_weight if appearance_weight is not None else 0.10, 0.0), 0.15)
                 score_matrix = (1.0 - w_app) * score_matrix + w_app * emb_cost
 
-            if state_heading_enabled and len(detections) > 0 and len(trackers) > 0:
-                heading_consistency = np.full_like(score_matrix, 0.5, dtype=np.float32)
-                track_reliability = np.ones((len(trackers),), dtype=np.float32) * 0.5
-                for t_idx, trk in enumerate(trackers):
-                    det_conf = float(getattr(trk, 'heading_conf_det', 0.5))
-                    vel_conf = float(getattr(trk, 'heading_conf_vel', 0.5))
-                    track_reliability[t_idx] = np.clip(0.5 * (det_conf + vel_conf), 0.0, 1.0)
-                for d_idx, det in enumerate(detections):
-                    det_heading = extract_detection_heading(det)
-                    for t_idx, trk in enumerate(trackers):
-                        trk_heading = extract_track_heading(trk)
-                        heading_consistency[d_idx, t_idx] = compute_heading_consistency(
-                            trk_heading,
-                            det_heading,
-                            sigma=state_heading_sigma,
-                        )
-                blend = np.clip(0.15 * track_reliability.reshape(1, -1), 0.0, 0.15)
-                score_matrix = (1.0 - blend) * score_matrix + blend * heading_consistency
-
-            baseline_score_matrix = score_matrix.copy()
-            baseline_gated_score_matrix = baseline_score_matrix.copy()
-            if dist_thr_vec is not None and dist_matrix is not None:
-                baseline_gated_score_matrix[dist_matrix > dist_thr_vec.reshape(1, -1)] = -1e9
-            baseline_gated_score_matrix[baseline_candidate_mask == 0] = -1e9
-
-            if heading_rescore_enabled:
-                ambiguous_mask = np.zeros_like(candidate_mask, dtype=bool)
-
-                for det_idx in range(candidate_mask.shape[0]):
-                    valid_cols = np.where(candidate_mask[det_idx] > 0)[0]
-                    if valid_cols.size >= 2:
-                        row_scores = score_matrix[det_idx, valid_cols]
-                        best_score = row_scores.max()
-                        near_best = valid_cols[(best_score - row_scores) <= heading_margin]
-                        if near_best.size >= 2:
-                            ambiguous_mask[det_idx, near_best] = True
-
-                for trk_idx in range(candidate_mask.shape[1]):
-                    valid_rows = np.where(candidate_mask[:, trk_idx] > 0)[0]
-                    if valid_rows.size >= 2:
-                        col_scores = score_matrix[valid_rows, trk_idx]
-                        best_score = col_scores.max()
-                        near_best = valid_rows[(best_score - col_scores) <= heading_margin]
-                        if near_best.size >= 2:
-                            ambiguous_mask[near_best, trk_idx] = True
-
-                if ambiguous_mask.any():
-                    _update_heading_stats(
-                        heading_stats,
-                        ambiguous_calls=1,
-                        ambiguous_pairs=int(ambiguous_mask.sum())
-                    )
-                    heading_penalty = np.zeros_like(score_matrix, dtype=np.float32)
-                    for det_idx, trk_idx in zip(*np.where(ambiguous_mask)):
-                        det_heading = extract_detection_heading(detections[det_idx])
-                        trk_heading = extract_track_heading(trackers[trk_idx])
-                        heading_penalty[det_idx, trk_idx] = compute_heading_distance(
-                            trk_heading,
-                            det_heading,
-                            metric=heading_metric
-                        )
-                    suppress_mask = ambiguous_mask & (heading_penalty >= heading_hard_gate_threshold)
-                    if suppress_mask.any():
-                        score_matrix = score_matrix.copy()
-                        score_matrix[suppress_mask] = -1e9
-                        _update_heading_stats(
-                            heading_stats,
-                            suppressed_pairs=int(suppress_mask.sum())
-                        )
-                    soft_mask = ambiguous_mask & (~suppress_mask)
-                    if soft_mask.any():
-                        score_matrix = score_matrix.copy()
-                        score_matrix[soft_mask] = score_matrix[soft_mask] - heading_weight * heading_penalty[soft_mask]
+            pair_risk, identity_support, row_ambiguity, col_ambiguity = compute_association_risk_context(
+                score_matrix,
+                candidate_mask,
+                detections,
+                trackers,
+                emb_cost=emb_cost,
+                risk_options=risk_options,
+            )
+            score_matrix = apply_association_risk_tempering(
+                score_matrix,
+                pair_risk,
+                identity_support,
+                risk_options=risk_options,
+            )
 
             score_matrix[candidate_mask == 0] = -1e9
             if dist_thr_vec is not None and dist_matrix is not None:
                 score_matrix = score_matrix.copy()
                 score_matrix[dist_matrix > dist_thr_vec.reshape(1, -1)] = -1e9
-
-            if heading_rescore_enabled:
-                valid_row_mask = np.any(baseline_gated_score_matrix > -1e8, axis=1)
-                valid_col_mask = np.any(baseline_gated_score_matrix > -1e8, axis=0)
-                if valid_row_mask.any():
-                    baseline_row_best = np.argmax(baseline_gated_score_matrix, axis=1)
-                    rescored_row_best = np.argmax(score_matrix, axis=1)
-                    row_flips = int(np.sum((baseline_row_best != rescored_row_best) & valid_row_mask))
-                    if row_flips > 0:
-                        _update_heading_stats(heading_stats, winner_flip_rows=row_flips)
-                if valid_col_mask.any():
-                    baseline_col_best = np.argmax(baseline_gated_score_matrix, axis=0)
-                    rescored_col_best = np.argmax(score_matrix, axis=0)
-                    col_flips = int(np.sum((baseline_col_best != rescored_col_best) & valid_col_mask))
-                    if col_flips > 0:
-                        _update_heading_stats(heading_stats, winner_flip_cols=col_flips)
-                baseline_matched_indices = linear_assignment(-baseline_gated_score_matrix)
-            else:
-                baseline_matched_indices = linear_assignment(-baseline_gated_score_matrix)
             matched_indices = linear_assignment(-score_matrix)
-
-            if heading_enabled:
-                if heading_pre_gate_enabled:
-                    baseline_candidate_pairs = set((int(r), int(c)) for r, c in zip(*np.where(baseline_candidate_mask > 0)))
-                    gated_candidate_pairs = set((int(r), int(c)) for r, c in zip(*np.where(candidate_mask > 0)))
-                    removed_pairs = baseline_candidate_pairs - gated_candidate_pairs
-                    if removed_pairs:
-                        baseline_pre_gate_matrix = baseline_score_matrix.copy()
-                        baseline_pre_gate_matrix[baseline_candidate_mask == 0] = -1e9
-                        if dist_thr_vec is not None and dist_matrix is not None:
-                            baseline_pre_gate_matrix[dist_matrix > dist_thr_vec.reshape(1, -1)] = -1e9
-                        pre_gate_matrix = baseline_score_matrix.copy()
-                        pre_gate_matrix[candidate_mask == 0] = -1e9
-                        if dist_thr_vec is not None and dist_matrix is not None:
-                            pre_gate_matrix[dist_matrix > dist_thr_vec.reshape(1, -1)] = -1e9
-                        baseline_pre_gate_matches = linear_assignment(-baseline_pre_gate_matrix)
-                        post_pre_gate_matches = linear_assignment(-pre_gate_matrix)
-                        baseline_pre_gate_pairs = set((int(m[0]), int(m[1])) for m in baseline_pre_gate_matches)
-                        post_pre_gate_pairs = set((int(m[0]), int(m[1])) for m in post_pre_gate_matches)
-                        if baseline_pre_gate_pairs != post_pre_gate_pairs:
-                            _update_heading_stats(
-                                heading_stats,
-                                pre_gate_changed_matches=len(baseline_pre_gate_pairs.symmetric_difference(post_pre_gate_pairs))
-                            )
-                baseline_pairs = set((int(m[0]), int(m[1])) for m in baseline_matched_indices)
-                rescored_pairs = set((int(m[0]), int(m[1])) for m in matched_indices)
-                if baseline_pairs != rescored_pairs:
-                    changed_pairs = len(baseline_pairs.symmetric_difference(rescored_pairs))
-                    _update_heading_stats(
-                        heading_stats,
-                        changed_calls=1,
-                        changed_pairs=changed_pairs
-                    )
+            matched_indices, diagnostics = apply_deferred_commitment(
+                matched_indices,
+                score_matrix,
+                candidate_mask,
+                pair_risk,
+                identity_support,
+                row_ambiguity,
+                col_ambiguity,
+                options=risk_options,
+            )
     else:
         matched_indices = np.empty(shape=(0, 2))
 
@@ -564,6 +575,11 @@ def associate_detections_to_trackers_fusion(detections, trackers, aw_off, grid_o
     else:
         matches = np.concatenate(matches, axis=0)
 
+    if return_diagnostics:
+        diagnostics['final_match_count'] = int(matches.shape[0]) if matches.ndim == 2 else 0
+        diagnostics['deferred_det_indices'] = sorted(set(int(x) for x in diagnostics.get('deferred_det_indices', [])))
+        diagnostics['deferred_trk_indices'] = sorted(set(int(x) for x in diagnostics.get('deferred_trk_indices', [])))
+        return matches, np.array(unmatched_detections), np.array(unmatched_trackers), diagnostics
     return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
 
 def trackfusion2Dand3D(tracker_2D, trks_3Dto2D_image, iou_threshold):

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "external/TrackEval")
 import trackeval
 
 if __name__ == "__main__":
+    tracker_name = 'virconv_OCM'
     # 评估配置
     eval_config = trackeval.Evaluator.get_default_eval_config()
     eval_config['DISPLAY_LESS_PROGRESS'] = False
@@ -25,7 +26,7 @@ if __name__ == "__main__":
     dataset_config = trackeval.datasets.Kitti2DBox.get_default_dataset_config()
     dataset_config['GT_FOLDER'] = r'e:\mot\datasets\kitti\train'
     dataset_config['TRACKERS_FOLDER'] = r'e:\mot\results'
-    dataset_config['TRACKERS_TO_EVAL'] = ['virconv_OCM']
+    dataset_config['TRACKERS_TO_EVAL'] = [tracker_name]
     dataset_config['CLASSES_TO_EVAL'] = ['car']  # 只评估car,因为没有检测到pedestrian
     dataset_config['SPLIT_TO_EVAL'] = 'training'
     dataset_config['TRACKER_SUB_FOLDER'] = 'data'

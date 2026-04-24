@@ -93,22 +93,51 @@ class Tracker:
         self.multi_frame_config.use_nonlinear_backtrack = False  # 基础开关保持关闭
         self.multi_frame_config.use_acceleration_gate = False   # ❌ 基线：关闭加速度门控
         self.multi_frame_config.acceleration_threshold = 1.5   # 加速度阈值 (m/s²)
-        self.heading_ambiguity_rescore_enabled = False
-        self.heading_distance_metric = 'symmetric'
-        self.heading_ambiguity_margin = 0.08
-        self.heading_ambiguity_weight = 0.20
-        self.heading_pre_gate_enabled = True
-        self.heading_pre_gate_threshold = 0.55
-        self.heading_hard_gate_threshold = 0.45
         self.use_rotated_geom_in_l1 = False
         self.use_rotated_geom_in_l2 = False
         self.use_rotated_geom_in_l15 = False
         self.rotated_geom_weight_l15 = 0.20
-        self.use_state_heading_in_l1 = False
-        self.use_state_heading_in_l2 = False
-        self.use_state_heading_in_l15 = False
-        self.state_heading_sigma = 0.45
-        self.heading_stats = {}
+        self.enable_l12_risk_model = True
+        self.enable_l12_risk_tempering = False
+        self.enable_l1_deferred_commitment = True
+        self.enable_l2_deferred_commitment = False
+        self.l12_risk_margin_center = 0.08
+        self.l12_risk_margin_gain = 18.0
+        self.l12_risk_score_center = 0.45
+        self.l12_risk_score_gain = 8.0
+        self.l12_risk_tsu_center = 1.5
+        self.l12_risk_tsu_gain = 3.0
+        self.l12_risk_beta_center = 0.55
+        self.l12_risk_beta_gain = 8.0
+        self.l12_risk_uncertainty_center = 0.25
+        self.l12_risk_uncertainty_gain = 8.0
+        self.l12_risk_uncertainty_norm = 12.0
+        self.l12_risk_temper_strength = 0.20
+        self.l12_risk_app_support_center = 0.55
+        self.l12_risk_app_support_gain = 10.0
+        self.l12_risk_app_rescue = 0.06
+        self.l12_defer_score_center = 0.28
+        self.l12_defer_score_gain = 10.0
+        self.l12_defer_ambiguity_center = 0.55
+        self.l12_defer_ambiguity_gain = 10.0
+        self.l12_defer_threshold = 0.16
+        self.l12_defer_identity_floor = 0.60
+        self.enable_l12_defer_diag_log = False
+        self.l12_defer_diag_log_path = None
+        self.total_l12_deferred_pairs = 0
+        self.total_l12_deferred_recovered_l15 = 0
+        self.enable_assoc_level_diag = False
+        self.enable_l4_identity_tempering = True
+        self.l4_handover_hits_center = 6.0
+        self.l4_handover_hits_gain = 1.2
+        self.l4_handover_age_center = 4.0
+        self.l4_handover_age_gain = 0.8
+        self.l4_handover_tsu_center = 1.5
+        self.l4_handover_tsu_gain = 1.5
+        self.l4_handover_score_threshold = 0.72
+        self.total_l4_matches = 0
+        self.total_l4_id_takeovers = 0
+        self.total_l4_id_kept = 0
         self.last_t_L1 = 0.0
         self.last_t_L15 = 0.0
         self.last_t_L2 = 0.0
@@ -176,15 +205,36 @@ class Tracker:
                 return
         except Exception:
             return
-        if not track.is_confirmed():
+
+    def _append_l12_defer_diag_log(self, diag_info):
+        if not getattr(self, 'enable_l12_defer_diag_log', False):
+            return
+        log_path = getattr(self, 'l12_defer_diag_log_path', None)
+        if not log_path:
             return
         try:
-            track.add_memory_feature(
-                emb,
-                max_size=getattr(cfg, 'memory_bank_size', 3)
-            )
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            seq_id = getattr(self.multi_frame_config, 'current_seq_id', 'unknown')
+            curr_frame = getattr(self.multi_frame_config, 'current_data_frame', self.current_frame)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(
+                    '[L1 DeferDiag][{}] frame={} initial_matches={} final_matches={} deferred_pairs={} '
+                    'deferred_det_count={} deferred_trk_count={} recovered_by_l15={} deferred_examples={}\n'.format(
+                        seq_id,
+                        int(curr_frame) if curr_frame is not None else int(self.current_frame),
+                        int(diag_info.get('initial_match_count', 0)),
+                        int(diag_info.get('final_match_count', 0)),
+                        int(diag_info.get('deferred_pair_count', 0)),
+                        int(diag_info.get('deferred_det_count', 0)),
+                        int(diag_info.get('deferred_trk_count', 0)),
+                        int(diag_info.get('recovered_by_l15', 0)),
+                        diag_info.get('deferred_examples', []),
+                    )
+                )
         except Exception:
-            return
+            pass
 
     def predict_3d(self):
         # print(self.tracks_3d)
@@ -198,88 +248,71 @@ class Tracker:
             # print(track)
             track.predict_2d(self.kf_2d)
 
-    def _get_heading_options(self, stage=None):
+    def _get_l12_risk_options(self, stage='l1'):
         return {
-            'enabled': self.heading_ambiguity_rescore_enabled,
-            'metric': self.heading_distance_metric,
-            'ambiguity_margin': self.heading_ambiguity_margin,
-            'weight': self.heading_ambiguity_weight,
-            'pre_gate_enabled': self.heading_pre_gate_enabled,
-            'pre_gate_threshold': self.heading_pre_gate_threshold,
-            'hard_gate_threshold': self.heading_hard_gate_threshold,
-            'use_state_heading': (
-                self.use_state_heading_in_l1 if stage == 'l1'
-                else self.use_state_heading_in_l2 if stage == 'l2'
-                else False
+            'enabled': bool(getattr(self, 'enable_l12_risk_model', False)),
+            'enable_tempering': bool(getattr(self, 'enable_l12_risk_tempering', False)),
+            'enable_deferral': bool(
+                getattr(self, 'enable_l1_deferred_commitment', False)
+                if stage == 'l1' else getattr(self, 'enable_l2_deferred_commitment', False)
             ),
-            'use_rotated_geom': (
-                self.use_rotated_geom_in_l1 if stage == 'l1'
-                else self.use_rotated_geom_in_l2 if stage == 'l2'
-                else False
-            ),
-            'state_heading_sigma': self.state_heading_sigma,
-            'stats': self.heading_stats,
+            'margin_center': float(getattr(self, 'l12_risk_margin_center', 0.08)),
+            'margin_gain': float(getattr(self, 'l12_risk_margin_gain', 18.0)),
+            'score_center': float(getattr(self, 'l12_risk_score_center', 0.45)),
+            'score_gain': float(getattr(self, 'l12_risk_score_gain', 8.0)),
+            'tsu_center': float(getattr(self, 'l12_risk_tsu_center', 1.5)),
+            'tsu_gain': float(getattr(self, 'l12_risk_tsu_gain', 3.0)),
+            'beta_center': float(getattr(self, 'l12_risk_beta_center', 0.55)),
+            'beta_gain': float(getattr(self, 'l12_risk_beta_gain', 8.0)),
+            'uncertainty_center': float(getattr(self, 'l12_risk_uncertainty_center', 0.25)),
+            'uncertainty_gain': float(getattr(self, 'l12_risk_uncertainty_gain', 8.0)),
+            'uncertainty_norm': float(getattr(self, 'l12_risk_uncertainty_norm', 12.0)),
+            'temper_strength': float(getattr(self, 'l12_risk_temper_strength', 0.20)),
+            'app_support_center': float(getattr(self, 'l12_risk_app_support_center', 0.55)),
+            'app_support_gain': float(getattr(self, 'l12_risk_app_support_gain', 10.0)),
+            'app_rescue': float(getattr(self, 'l12_risk_app_rescue', 0.06)),
+            'defer_score_center': float(getattr(self, 'l12_defer_score_center', 0.28)),
+            'defer_score_gain': float(getattr(self, 'l12_defer_score_gain', 10.0)),
+            'defer_ambiguity_center': float(getattr(self, 'l12_defer_ambiguity_center', 0.55)),
+            'defer_ambiguity_gain': float(getattr(self, 'l12_defer_ambiguity_gain', 10.0)),
+            'defer_threshold': float(getattr(self, 'l12_defer_threshold', 0.16)),
+            'defer_identity_floor': float(getattr(self, 'l12_defer_identity_floor', 0.60)),
         }
 
-    def reset_heading_stats(self):
-        self.heading_stats = {
-            'calls': 0,
-            'changed_calls': 0,
-            'changed_pairs': 0,
-            'pre_gate_suppressed_pairs': 0,
-            'pre_gate_changed_matches': 0,
-        }
-
-    def _wrap_to_pi(self, angle):
-        return math.atan2(math.sin(angle), math.cos(angle))
-
-    def _compute_state_heading_consistency(self, track, detection, det_vel=None):
+    def _sigmoid(self, x):
         try:
-            track_heading = float(track.get_predicted_heading(1.0)) if hasattr(track, 'get_predicted_heading') else float(track.pose[3])
+            x = float(x)
         except Exception:
-            return 0.5
+            x = 0.0
+        x = max(min(x, 60.0), -60.0)
+        return 1.0 / (1.0 + math.exp(-x))
 
-        obs_angles = []
-        obs_weights = []
+    def _compute_l4_handover_strength(self, track_2d, track_3d):
+        hits_2d = float(getattr(track_2d, 'hits', 0))
+        age_2d = float(getattr(track_2d, 'age', 0))
+        tsu_3d = float(getattr(track_3d, 'time_since_update', 0))
+        confirmed_2d = 1.0 if bool(track_2d.is_confirmed()) else 0.0
 
-        try:
-            det_heading = float(detection.bbox[3])
-            det_conf = float(getattr(track, 'heading_conf_det', 0.5))
-            obs_angles.append(det_heading)
-            obs_weights.append(max(det_conf, 1e-3))
-        except Exception:
-            pass
+        hits_term = self._sigmoid(
+            float(getattr(self, 'l4_handover_hits_gain', 1.2)) *
+            (hits_2d - float(getattr(self, 'l4_handover_hits_center', 6.0)))
+        )
+        age_term = self._sigmoid(
+            float(getattr(self, 'l4_handover_age_gain', 0.8)) *
+            (age_2d - float(getattr(self, 'l4_handover_age_center', 4.0)))
+        )
+        tsu_term = self._sigmoid(
+            float(getattr(self, 'l4_handover_tsu_gain', 1.5)) *
+            (tsu_3d - float(getattr(self, 'l4_handover_tsu_center', 1.5)))
+        )
 
-        if det_vel is None:
-            try:
-                det_vel = estimate_detection_velocity(detection, self.detection_history, self.current_frame)
-            except Exception:
-                det_vel = None
-        try:
-            if det_vel is not None:
-                vx = float(det_vel[0])
-                vz = float(det_vel[2])
-                vel_heading = math.atan2(vz, vx + 1e-6)
-                speed = math.sqrt(vx * vx + vz * vz)
-                vel_conf = (1.0 - math.exp(-speed / 3.0)) * max(float(getattr(track, 'heading_conf_vel', 0.5)), 1e-3)
-                obs_angles.append(vel_heading)
-                obs_weights.append(max(vel_conf, 1e-3))
-        except Exception:
-            pass
-
-        if len(obs_angles) == 0:
-            return 0.5
-
-        s = 0.0
-        c = 0.0
-        for ang, w in zip(obs_angles, obs_weights):
-            s += w * math.sin(ang)
-            c += w * math.cos(ang)
-        fused_obs = math.atan2(s, c) if (abs(s) > 1e-8 or abs(c) > 1e-8) else obs_angles[0]
-
-        delta = self._wrap_to_pi(track_heading - fused_obs)
-        sigma = max(float(self.state_heading_sigma), 1e-3)
-        return float(math.exp(-0.5 * (delta / sigma) ** 2))
+        # Confirmation is treated as a soft prior rather than a hard gate.
+        return float(
+            0.45 * hits_term +
+            0.25 * age_term +
+            0.20 * confirmed_2d +
+            0.10 * tsu_term
+        )
 
     @property
     def t_L1(self):
@@ -413,13 +446,18 @@ class Tracker:
         # 1st Level of Association
         t0 = time.time()
         iou_shreshold=0.01
-        matched_fusion_idx, unmatched_dets_fusion_idx, unmatched_trks_fusion_idx = associate_detections_to_trackers_fusion(
+        matched_fusion_idx, unmatched_dets_fusion_idx, unmatched_trks_fusion_idx, l1_diag = associate_detections_to_trackers_fusion(
             detection_3D_fusion, self.tracks_3d, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
             det_embs=dets_3D_fusion_embs, det_app=False, appearance_weight=self.appearance_weight_level1,
-            heading_options=self._get_heading_options(stage='l1'))
+            use_rotated_geom=self.use_rotated_geom_in_l1,
+            risk_options=self._get_l12_risk_options(stage='l1'),
+            return_diagnostics=True)
+        deferred_det_global = set(int(idx) for idx in l1_diag.get('deferred_det_indices', [])) if isinstance(l1_diag, dict) else set()
+        deferred_trk_global = set(int(idx) for idx in l1_diag.get('deferred_trk_indices', [])) if isinstance(l1_diag, dict) else set()
         
         for detection_idx, track_idx in matched_fusion_idx:
             self.tracks_3d[track_idx].update_3d(detection_3D_fusion[detection_idx], current_frame=self.current_frame)
+            self.tracks_3d[track_idx].set_assoc_source('L1', self.current_frame)
             if use_app_L1 and dets_3D_fusion_embs.shape[0] > detection_idx:
                 # 软更新策略：低分数采用极小步长
                 alpha_use = None
@@ -451,6 +489,7 @@ class Tracker:
         self.last_t_L1 = time.time() - t0
         # ========== Level 1.5: 速度自适应回溯关联 ==========
         # 在处理未匹配之前,先尝试速度回溯
+        recovered_from_defer = 0
         if self.velocity_backtrack_enabled and \
            len(unmatched_dets_fusion_idx) > 0 and \
            len(unmatched_trks_fusion_idx) > 0:
@@ -473,11 +512,14 @@ class Tracker:
             for det_idx, trk_idx in velocity_matched:
                 original_det_idx = unmatched_dets_fusion_idx[det_idx]
                 original_trk_idx = unmatched_trks_fusion_idx[trk_idx]
+                if original_det_idx in deferred_det_global and original_trk_idx in deferred_trk_global:
+                    recovered_from_defer += 1
                 
                 self.tracks_3d[original_trk_idx].update_3d(
                     detection_3D_fusion[original_det_idx],
                     current_frame=self.current_frame
                 )
+                self.tracks_3d[original_trk_idx].set_assoc_source('L1.5', self.current_frame)
                 if not self.app_off:
                     # 软更新策略：低分数采用极小步长
                     try:
@@ -514,6 +556,31 @@ class Tracker:
             pass
 
         # 处理最终未匹配的轨迹
+        if isinstance(l1_diag, dict):
+            deferred_pairs = l1_diag.get('deferred_pairs', [])
+            self.total_l12_deferred_pairs += len(deferred_pairs)
+            self.total_l12_deferred_recovered_l15 += int(recovered_from_defer)
+            deferred_examples = []
+            for item in deferred_pairs[:3]:
+                deferred_examples.append({
+                    'det_idx': int(item.get('det_idx', -1)),
+                    'trk_idx': int(item.get('trk_idx', -1)),
+                    'score': round(float(item.get('score', 0.0)), 4),
+                    'risk': round(float(item.get('pair_risk', 0.0)), 4),
+                    'amb': round(float(item.get('ambiguity', 0.0)), 4),
+                    'id': round(float(item.get('identity_support', 0.0)), 4),
+                    'defer': round(float(item.get('defer_strength', 0.0)), 4),
+                })
+            self._append_l12_defer_diag_log({
+                'initial_match_count': int(l1_diag.get('initial_match_count', 0)),
+                'final_match_count': int(l1_diag.get('final_match_count', 0)),
+                'deferred_pair_count': int(len(deferred_pairs)),
+                'deferred_det_count': int(len(deferred_det_global)),
+                'deferred_trk_count': int(len(deferred_trk_global)),
+                'recovered_by_l15': int(recovered_from_defer),
+                'deferred_examples': deferred_examples,
+            })
+
         for track_idx in unmatched_trks_fusion_idx:
             self.tracks_3d[track_idx].fusion_time_update += 1
             self.tracks_3d[track_idx].mark_missed()
@@ -525,12 +592,14 @@ class Tracker:
         matched_only_idx, unmatched_dets_only_idx, _ = associate_detections_to_trackers_fusion(
             detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
             det_embs=dets_3D_only_embs, det_app=self.app_off, appearance_weight=self.appearance_weight_level1,
-            heading_options=self._get_heading_options(stage='l2'))
+            use_rotated_geom=self.use_rotated_geom_in_l2,
+            risk_options=self._get_l12_risk_options(stage='l2'))
         index_to_delete = []
         for detection_idx, track_idx in matched_only_idx:
             for index, t in enumerate(self.tracks_3d):
                 if t.track_id_3d == self.unmatch_tracks_3d1[track_idx].track_id_3d:
                     t.update_3d(detection_3D_only[detection_idx], current_frame=self.current_frame)
+                    t.set_assoc_source('L2', self.current_frame)
                     if not self.app_off:
                         # 软更新策略：低分数采用极小步长（若无score则按固定alpha）
                         try:
@@ -548,7 +617,7 @@ class Tracker:
                     break
         self.unmatch_tracks_3d1 = [self.unmatch_tracks_3d1[i] for i in range(len(self.unmatch_tracks_3d1)) if i not in index_to_delete]
         for detection_idx in unmatched_dets_only_idx:
-            self._initiate_track_3d(detection_3D_only[detection_idx], dets_3D_only_embs[detection_idx])
+            self._initiate_track_3d(detection_3D_only[detection_idx], dets_3D_only_embs[detection_idx], source_level='L2_INIT')
         self.last_t_L2 = time.time() - t2
 
         # ========== 多帧关联 (Level 2.5) - 移至L2之后 ==========
@@ -594,6 +663,8 @@ class Tracker:
                 # 从未匹配列表中移除已匹配的轨迹（按ID）
                 recovered_ids = set(t.track_id_3d for t in updated_tracks)
                 self.unmatch_tracks_3d1 = [t for t in self.unmatch_tracks_3d1 if t.track_id_3d not in recovered_ids]
+                for trk in updated_tracks:
+                    trk.set_assoc_source('L2.5', self.current_frame)
 
                 # 可选：更新外观（基于当前帧融合3D检测近邻）
                 if not self.app_off and len(updated_tracks) > 0:
@@ -616,7 +687,7 @@ class Tracker:
         # 在L2.5之后再对未匹配的融合3D检测新建轨迹
         if len(unmatched_dets_fusion_idx) > 0:
             for detection_idx in unmatched_dets_fusion_idx:
-                self._initiate_track_3d(detection_3D_fusion[detection_idx], dets_3D_fusion_embs[detection_idx])
+                self._initiate_track_3d(detection_3D_fusion[detection_idx], dets_3D_fusion_embs[detection_idx], source_level='L1_INIT')
 
         # 冲突轨迹清理（基于中心距离）
         def _cleanup_track_conflicts(pos_thresh=1.0):
@@ -637,6 +708,8 @@ class Tracker:
                         elif aj and not ai:
                             loser = ti
                         else:
+                            self.total_l4_id_kept += 1
+                            assoc_level = 'L4_KEEP'
                             if ti.hits != tj.hits:
                                 loser = ti if ti.hits < tj.hits else tj
                             elif ti.age != tj.age:
@@ -656,12 +729,13 @@ class Tracker:
         matched, unmatch_trks, unmatch_dets = associate_detections_to_tracks(self.tracks_2d, detection_2D_only, iou_shreshold, self.aw_off,self.grid_off,self.mot_off, det_embs=dets_2D_only_embs, det_app = self.app_off)
         for track_idx, detection_idx in matched:
             self.tracks_2d[track_idx].update_2d(self.kf_2d, detection_2D_only[detection_idx])
+            self.tracks_2d[track_idx].set_assoc_source('L3', self.current_frame)
             if not self.app_off:
                 self.tracks_2d[track_idx].update_emb(dets_2D_only_embs[detection_idx])
         for track_idx in unmatch_trks:
             self.tracks_2d[track_idx].mark_missed()
         for detection_idx in unmatch_dets:
-            self._initiate_track_2d(detection_2D_only[detection_idx], dets_2D_only_embs[detection_idx])
+            self._initiate_track_2d(detection_2D_only[detection_idx], dets_2D_only_embs[detection_idx], source_level='L3_INIT')
         self.tracks_2d = [t for t in self.tracks_2d if not t.is_deleted()]
         self.last_t_L3 = time.time() - t3
 
@@ -672,19 +746,32 @@ class Tracker:
         for track_idx_2d, track_idx_3d in matched_track_2d:
             for i in range(len(self.tracks_3d)):
                 if self.tracks_3d[i].track_id_3d == self.unmatch_tracks_3d[track_idx_3d].track_id_3d:
+                    self.total_l4_matches += 1
                     self.tracks_3d[i].age = self.tracks_2d[track_idx_2d].age + 1
+                    assoc_level = 'L4'
                     if self.tracks_3d[i].track_id_3d % 2 ==0:
                         new_id = self.tracks_2d[track_idx_2d].track_id_2d
                         # ========== 修复: 检查ID唯一性 ==========
                         existing_ids = [t.track_id_3d for t in self.tracks_3d if t != self.tracks_3d[i]]
-                        if new_id not in existing_ids:
-                            # print(self.tracks_3d[i].track_id_3d,self.tracks_2d[track_idx_2d].track_id_2d)
+                        handover_strength = self._compute_l4_handover_strength(
+                            self.tracks_2d[track_idx_2d],
+                            self.tracks_3d[i],
+                        )
+                        allow_takeover = True
+                        if getattr(self, 'enable_l4_identity_tempering', True):
+                            allow_takeover = handover_strength >= float(
+                                getattr(self, 'l4_handover_score_threshold', 0.72)
+                            )
+                        if new_id not in existing_ids and allow_takeover:
                             self.tracks_3d[i].track_id_3d = new_id
-                            # print("recite:",self.tracks_3d[i].track_id_3d)
+                            self.total_l4_id_takeovers += 1
                         else:
                             print(f"⚠️ 跳过ID修改: {new_id} 已存在于tracks_3d中")
+                            self.total_l4_id_kept += 1
+                            assoc_level = 'L4_KEEP'
                         # ========================================
                     self.tracks_3d[i].time_since_update = 0
+                    self.tracks_3d[i].set_assoc_source(assoc_level, self.current_frame)
                     if self.tracks_2d[track_idx_2d].hits >= 2:
                         self.tracks_3d[i].hits = self.tracks_2d[track_idx_2d].hits + 1
                     else:
@@ -1028,16 +1115,20 @@ class Tracker:
     def _debug_print_active_betas(self):
         return
 
-    def _initiate_track_3d(self, detection,emb=None):
+    def _initiate_track_3d(self, detection, emb=None, source_level='INIT'):
         self.kf_3d = KalmanBoxTracker(detection.bbox)
         self.additional_info = detection.additional_info
         pose = np.concatenate(self.kf_3d.kf.x[:7], axis=0)
-        self.tracks_3d.append(Track_3D(pose, self.kf_3d, self.track_id_3d, self.n_init, self.max_age, self.additional_info, emb, init_frame=self.current_frame))
+        trk = Track_3D(pose, self.kf_3d, self.track_id_3d, self.n_init, self.max_age, self.additional_info, emb, init_frame=self.current_frame)
+        trk.set_assoc_source(source_level, self.current_frame)
+        self.tracks_3d.append(trk)
         self.track_id_3d += 2
 
-    def _initiate_track_2d(self, detection,emb):
+    def _initiate_track_2d(self, detection, emb, source_level='INIT'):
         mean, covariance = self.kf_2d.initiate(detection.to_xyah())
-        self.tracks_2d.append(Track_2D(mean, covariance, self.track_id_2d, self.n_init, self.max_age,emb))
+        trk = Track_2D(mean, covariance, self.track_id_2d, self.n_init, self.max_age, emb)
+        trk.set_assoc_source(source_level, self.current_frame)
+        self.tracks_2d.append(trk)
         self.track_id_2d += 2
     
     def _identify_scene_type(self, detections, tracks):
@@ -1174,17 +1265,7 @@ class Tracker:
                     )
                     geom_w = max(0.0, min(1.0, float(self.rotated_geom_weight_l15)))
                     base_score = (1.0 - geom_w) * base_score + geom_w * rotated_geom_sim
-                if self.use_state_heading_in_l15:
-                    heading_score = self._compute_state_heading_consistency(
-                        tracks[t], detections[d]
-                    )
-                    heading_mix = max(0.0, min(1.0, 0.5 * (
-                        float(getattr(tracks[t], 'heading_conf_det', 0.5)) +
-                        float(getattr(tracks[t], 'heading_conf_vel', 0.5))
-                    )))
-                    combined_matrix[d, t] = (1.0 - heading_mix) * base_score + heading_mix * heading_score
-                else:
-                    combined_matrix[d, t] = base_score
+                combined_matrix[d, t] = base_score
         return combined_matrix
 
     def _compute_l15_selective_suppression_strength(

@@ -64,6 +64,8 @@ class Track_3D:
         self.heading_conf_vel = 0.0
         self.heading_last_frame = init_frame
         self.heading_history = [(init_frame, self.fused_heading)]
+        self.last_assoc_level = 'INIT'
+        self.last_assoc_frame = int(init_frame)
         
         # ========== 方案3: 多帧回溯 - 速度历史 ==========
         self.velocity_history = []  # [(frame_id, velocity), ...]
@@ -72,6 +74,18 @@ class Track_3D:
         # 初始化第一帧速度（使用全局帧号）
         initial_velocity = self.kf_3d.kf.x[7:10].flatten()
         self.velocity_history.append((init_frame, initial_velocity.copy()))
+
+    def set_assoc_source(self, level, frame):
+        if level is None:
+            return
+        try:
+            self.last_assoc_level = str(level)
+        except Exception:
+            self.last_assoc_level = 'UNKNOWN'
+        try:
+            self.last_assoc_frame = int(frame)
+        except Exception:
+            pass
 
     def predict_3d(self, trk_3d):
         self.pose = trk_3d.predict()
