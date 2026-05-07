@@ -7,6 +7,7 @@ from tracking.cost_function import (iou_batch, get_velocity, compute_velocity_si
                                      estimate_detection_velocity, compute_velocity_trend_similarity,
                                      compute_smooth_velocity_similarity, compute_adaptive_weight_linear)
 from tracking.matching import associate_detections_to_trackers_fusion, associate_2D_to_3D_tracking, linear_assignment,associate_detections_to_tracks, compute_rotated_ground_similarity
+from tracking.motion_reliability import MotionReliabilityCalibrator, MotionReliabilitySampleExporter
 from tracking.track_2d import Track_2D
 from tracking.kalman_fileter_3d import  KalmanBoxTracker
 from tracking.track_3d import Track_3D, TrackState
@@ -64,10 +65,21 @@ class Tracker:
         
         # ========== 多帧关联配置 ==========
         self.use_confidence_aware_motion_l15 = False
+        self.l15_motion_reliability_mode = 'manual'
+        self.l15_motion_reliability_model_path = ''
+        self.l15_motion_reliability_feature_names = list(MotionReliabilityCalibrator.DEFAULT_FEATURES)
         self.l15_motion_reliability_bias = -0.2
         self.l15_motion_reliability_score_gain = 2.5
         self.l15_motion_reliability_uncertainty_gain = 2.0
         self.l15_motion_reliability_neutral = 0.5
+        self.enable_l15_reliability_pair_reweight = True
+        self.l15_reliability_pair_reweight_strength = 1.0
+        self._l15_motion_reliability_calibrator = None
+        self._l15_motion_reliability_signature = None
+        self.enable_l15_motion_sample_export = False
+        self.l15_motion_sample_export_path = ''
+        self._l15_motion_sample_exporter = None
+        self._l15_motion_sample_export_signature = None
         self.l15_motion_suppress_only_above = 0.5
         self.l15_motion_v4_high_sim_threshold = 0.80
         self.l15_motion_v4_raw_focus_gain = 10.0
@@ -90,6 +102,7 @@ class Tracker:
         self.multi_frame_config.verbose = False
         self.multi_frame_config.appearance_weight = 0.2
         self.multi_frame_config.appearance_hard_gate = 0.50
+        self.multi_frame_config.geometry_mode = 'box_iou'
         self.multi_frame_config.use_nonlinear_backtrack = False  # 基础开关保持关闭
         self.multi_frame_config.use_acceleration_gate = False   # ❌ 基线：关闭加速度门控
         self.multi_frame_config.acceleration_threshold = 1.5   # 加速度阈值 (m/s²)
@@ -97,6 +110,11 @@ class Tracker:
         self.use_rotated_geom_in_l2 = False
         self.use_rotated_geom_in_l15 = False
         self.rotated_geom_weight_l15 = 0.20
+        self.l12_rotated_geom_bev_weight = 1.0 / 3.0
+        self.l12_rotated_geom_center_weight = 1.0 / 3.0
+        self.l12_rotated_geom_size_weight = 1.0 / 3.0
+        self.l12_rotated_geom_center_tau = 1.0
+        self.l12_rotated_geom_size_tau = 1.0
         self.enable_l12_risk_model = True
         self.enable_l12_risk_tempering = False
         self.enable_l1_deferred_commitment = True
@@ -127,6 +145,7 @@ class Tracker:
         self.total_l12_deferred_pairs = 0
         self.total_l12_deferred_recovered_l15 = 0
         self.enable_assoc_level_diag = False
+        self.enable_l4_identity_takeover = True
         self.enable_l4_identity_tempering = True
         self.l4_handover_hits_center = 6.0
         self.l4_handover_hits_gain = 1.2
@@ -135,6 +154,8 @@ class Tracker:
         self.l4_handover_tsu_center = 1.5
         self.l4_handover_tsu_gain = 1.5
         self.l4_handover_score_threshold = 0.72
+        self.enable_l4_handover_diag_log = False
+        self.l4_handover_diag_log_path = None
         self.total_l4_matches = 0
         self.total_l4_id_takeovers = 0
         self.total_l4_id_kept = 0
@@ -236,6 +257,54 @@ class Tracker:
         except Exception:
             pass
 
+    def _append_l4_handover_diag_log(
+        self,
+        track_2d,
+        track_3d,
+        handover_strength,
+        allow_takeover,
+        new_id,
+        reason,
+    ):
+        if not getattr(self, 'enable_l4_handover_diag_log', False):
+            return
+        log_path = getattr(self, 'l4_handover_diag_log_path', None)
+        if not log_path:
+            return
+        try:
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            seq_id = getattr(self.multi_frame_config, 'current_seq_id', 'unknown')
+            curr_frame = getattr(self.multi_frame_config, 'current_data_frame', self.current_frame)
+            hits_2d = float(getattr(track_2d, 'hits', 0))
+            age_2d = float(getattr(track_2d, 'age', 0))
+            tsu_3d = float(getattr(track_3d, 'time_since_update', 0))
+            confirmed_2d = 1 if bool(track_2d.is_confirmed()) else 0
+            threshold = float(getattr(self, 'l4_handover_score_threshold', 0.72))
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(
+                    '[L4 HandoverDiag][{}] frame={} trk2d_id={} trk3d_id={} candidate_new_id={} '
+                    'hits_2d={:.6f} age_2d={:.6f} tsu_3d={:.6f} confirmed_2d={} '
+                    'handover_strength={:.6f} threshold={:.6f} allow_takeover={} reason={}\n'.format(
+                        seq_id,
+                        int(curr_frame) if curr_frame is not None else int(self.current_frame),
+                        int(getattr(track_2d, 'track_id_2d', -1)),
+                        int(getattr(track_3d, 'track_id_3d', -1)),
+                        int(new_id),
+                        hits_2d,
+                        age_2d,
+                        tsu_3d,
+                        confirmed_2d,
+                        float(handover_strength),
+                        threshold,
+                        int(bool(allow_takeover)),
+                        str(reason),
+                    )
+                )
+        except Exception:
+            pass
+
     def predict_3d(self):
         # print(self.tracks_3d)
         for track in self.tracks_3d:
@@ -286,6 +355,45 @@ class Tracker:
             x = 0.0
         x = max(min(x, 60.0), -60.0)
         return 1.0 / (1.0 + math.exp(-x))
+
+    def _get_l15_motion_reliability_calibrator(self):
+        signature = (
+            bool(getattr(self, 'use_confidence_aware_motion_l15', False)),
+            str(getattr(self, 'l15_motion_reliability_mode', 'manual')).strip().lower(),
+            str(getattr(self, 'l15_motion_reliability_model_path', '') or '').strip(),
+            float(getattr(self, 'det_thresh', 0.2)),
+            float(getattr(self, 'l15_motion_reliability_bias', -0.2)),
+            float(getattr(self, 'l15_motion_reliability_score_gain', 2.5)),
+            float(getattr(self, 'l15_motion_reliability_uncertainty_gain', 2.0)),
+            tuple(getattr(self, 'l15_motion_reliability_feature_names', MotionReliabilityCalibrator.DEFAULT_FEATURES)),
+        )
+        if self._l15_motion_reliability_calibrator is not None and self._l15_motion_reliability_signature == signature:
+            return self._l15_motion_reliability_calibrator
+        self._l15_motion_reliability_calibrator = MotionReliabilityCalibrator(
+            mode=getattr(self, 'l15_motion_reliability_mode', 'manual'),
+            det_thresh=getattr(self, 'det_thresh', 0.2),
+            manual_bias=getattr(self, 'l15_motion_reliability_bias', -0.2),
+            manual_score_gain=getattr(self, 'l15_motion_reliability_score_gain', 2.5),
+            manual_uncertainty_gain=getattr(self, 'l15_motion_reliability_uncertainty_gain', 2.0),
+            feature_names=getattr(self, 'l15_motion_reliability_feature_names', MotionReliabilityCalibrator.DEFAULT_FEATURES),
+            weight_path=getattr(self, 'l15_motion_reliability_model_path', ''),
+        )
+        self._l15_motion_reliability_signature = signature
+        return self._l15_motion_reliability_calibrator
+
+    def _get_l15_motion_sample_exporter(self):
+        signature = (
+            bool(getattr(self, 'enable_l15_motion_sample_export', False)),
+            str(getattr(self, 'l15_motion_sample_export_path', '') or '').strip(),
+        )
+        if self._l15_motion_sample_exporter is not None and self._l15_motion_sample_export_signature == signature:
+            return self._l15_motion_sample_exporter
+        self._l15_motion_sample_exporter = MotionReliabilitySampleExporter(
+            output_path=getattr(self, 'l15_motion_sample_export_path', ''),
+            enabled=getattr(self, 'enable_l15_motion_sample_export', False),
+        )
+        self._l15_motion_sample_export_signature = signature
+        return self._l15_motion_sample_exporter
 
     def _compute_l4_handover_strength(self, track_2d, track_3d):
         hits_2d = float(getattr(track_2d, 'hits', 0))
@@ -450,6 +558,13 @@ class Tracker:
             detection_3D_fusion, self.tracks_3d, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
             det_embs=dets_3D_fusion_embs, det_app=False, appearance_weight=self.appearance_weight_level1,
             use_rotated_geom=self.use_rotated_geom_in_l1,
+            rotated_geom_params={
+                'bev_weight': self.l12_rotated_geom_bev_weight,
+                'center_weight': self.l12_rotated_geom_center_weight,
+                'size_weight': self.l12_rotated_geom_size_weight,
+                'center_tau': self.l12_rotated_geom_center_tau,
+                'size_tau': self.l12_rotated_geom_size_tau,
+            },
             risk_options=self._get_l12_risk_options(stage='l1'),
             return_diagnostics=True)
         deferred_det_global = set(int(idx) for idx in l1_diag.get('deferred_det_indices', [])) if isinstance(l1_diag, dict) else set()
@@ -593,6 +708,13 @@ class Tracker:
             detection_3D_only, self.unmatch_tracks_3d1, self.aw_off, self.grid_off, self.mot_off, iou_shreshold,
             det_embs=dets_3D_only_embs, det_app=self.app_off, appearance_weight=self.appearance_weight_level1,
             use_rotated_geom=self.use_rotated_geom_in_l2,
+            rotated_geom_params={
+                'bev_weight': self.l12_rotated_geom_bev_weight,
+                'center_weight': self.l12_rotated_geom_center_weight,
+                'size_weight': self.l12_rotated_geom_size_weight,
+                'center_tau': self.l12_rotated_geom_center_tau,
+                'size_tau': self.l12_rotated_geom_size_tau,
+            },
             risk_options=self._get_l12_risk_options(stage='l2'))
         index_to_delete = []
         for detection_idx, track_idx in matched_only_idx:
@@ -766,9 +888,21 @@ class Tracker:
                             self.tracks_3d[i].track_id_3d = new_id
                             self.total_l4_id_takeovers += 1
                         else:
-                            print(f"⚠️ 跳过ID修改: {new_id} 已存在于tracks_3d中")
+                            print(f"[L4] 跳过ID修改: {new_id} 已存在于tracks_3d中")
                             self.total_l4_id_kept += 1
                             assoc_level = 'L4_KEEP'
+                        can_takeover = (new_id not in existing_ids) and allow_takeover
+                        diag_reason = 'takeover_accept' if can_takeover else (
+                            'duplicate_id_block' if new_id in existing_ids else 'score_below_threshold'
+                        )
+                        self._append_l4_handover_diag_log(
+                            self.tracks_2d[track_idx_2d],
+                            self.tracks_3d[i],
+                            handover_strength=handover_strength,
+                            allow_takeover=can_takeover,
+                            new_id=new_id,
+                            reason=diag_reason,
+                        )
                         # ========================================
                     self.tracks_3d[i].time_since_update = 0
                     self.tracks_3d[i].set_assoc_source(assoc_level, self.current_frame)
@@ -797,6 +931,29 @@ class Tracker:
             print(f"❌ 警告：发现重复的轨迹ID: {duplicates}")
             print(f"   所有ID: {track_ids}")
             print(f"   帧号: {self.current_frame}")
+            for dup_id in duplicates:
+                dup_tracks = [
+                    t for t in self.tracks_3d
+                    if t.is_confirmed() and int(getattr(t, 'track_id_3d', -1)) == int(dup_id)
+                ]
+                for idx, dup_track in enumerate(dup_tracks):
+                    try:
+                        pose_xy = np.asarray(getattr(dup_track, 'pose', np.zeros(7)))[:3].tolist()
+                    except Exception:
+                        pose_xy = []
+                    print(
+                        "   dup[{}] id={} hits={} age={} tsu={} state={} assoc={} assoc_frame={} pose={}".format(
+                            idx,
+                            int(getattr(dup_track, 'track_id_3d', -1)),
+                            int(getattr(dup_track, 'hits', -1)),
+                            int(getattr(dup_track, 'age', -1)),
+                            int(getattr(dup_track, 'time_since_update', -1)),
+                            int(getattr(dup_track, 'state', -1)),
+                            str(getattr(dup_track, 'last_assoc_level', 'UNKNOWN')),
+                            int(getattr(dup_track, 'last_assoc_frame', -1)),
+                            pose_xy,
+                        )
+                    )
         # ========================================
         
         # 更新检测历史 (帧计数已在函数开始时更新)
@@ -857,6 +1014,7 @@ class Tracker:
         if self.use_velocity_trend:
             trend_matrix = np.zeros((len(detections), len(tracks)))
         l15_motion_diag_entries = {} if self.use_confidence_aware_motion_l15 else None
+        l15_sample_exporter = self._get_l15_motion_sample_exporter() if self.use_confidence_aware_motion_l15 else None
         
         for d, det in enumerate(detections):
             det_vel = estimate_detection_velocity(det, self.detection_history, self.current_frame)
@@ -871,7 +1029,11 @@ class Tracker:
                     velocity_matrix[d, t] = compute_velocity_similarity(trk_vel, det_vel)
 
                 if self.use_confidence_aware_motion_l15:
-                    motion_reliability_matrix[d, t] = self._compute_l15_motion_reliability(trk, det)
+                    motion_reliability_matrix[d, t] = self._compute_l15_motion_reliability(
+                        trk,
+                        det,
+                        vel_sim=velocity_matrix[d, t],
+                    )
                 
                 if self.use_velocity_trend:
                     trend_matrix[d, t] = compute_velocity_trend_similarity(
@@ -928,7 +1090,12 @@ class Tracker:
                 w_vel_t, w_pos_t = compute_adaptive_weight_linear(trk_vel, self.velocity_weight_vmax)
             track_weights.append((w_vel_t, w_pos_t))
         combined_matrix = self._compute_l15_combined_matrix(
-            velocity_matrix, position_matrix, detections, tracks, track_weights
+            velocity_matrix,
+            position_matrix,
+            detections,
+            tracks,
+            track_weights,
+            motion_reliability_matrix=motion_reliability_matrix if self.use_confidence_aware_motion_l15 else None,
         )
 
         if self.use_confidence_aware_motion_l15:
@@ -948,6 +1115,13 @@ class Tracker:
                     provisional_score = float(provisional_combined_matrix[d, t])
                     row_margin = float(row_margins[d]) if is_winner_candidate and np.isfinite(row_margins[d]) else np.nan
                     raw_vel_sim = float(velocity_matrix[d, t])
+                    position_sim = float(position_matrix[d, t])
+                    base_w_vel, base_w_pos = track_weights[t]
+                    eff_w_vel, eff_w_pos = self._compute_l15_pair_adaptive_weights(
+                        base_w_vel,
+                        base_w_pos,
+                        float(motion_reliability_matrix[d, t]),
+                    )
                     effective_vel_sim = raw_vel_sim
                     suppression_strength = 0.0
                     suppression_applied = 0
@@ -972,10 +1146,15 @@ class Tracker:
                         detection=det,
                         raw_vel_sim=raw_vel_sim,
                         effective_vel_sim=float(effective_vel_sim),
+                        position_sim=position_sim,
                         motion_reliability=float(motion_reliability_matrix[d, t]),
                         suppression_applied=suppression_applied,
                         det_local_idx=d,
                         trk_local_idx=t,
+                        base_w_vel=float(base_w_vel),
+                        base_w_pos=float(base_w_pos),
+                        eff_w_vel=float(eff_w_vel),
+                        eff_w_pos=float(eff_w_pos),
                         combined_score=None,
                         row_top1=None,
                         col_top1=None,
@@ -987,9 +1166,41 @@ class Tracker:
                         defer_write=True,
                         pending_entries=l15_motion_diag_entries,
                     )
+                    if l15_sample_exporter is not None and l15_sample_exporter.enabled:
+                        det_gt_id = int(getattr(det, 'gt_track_id', -1))
+                        trk_gt_id = int(getattr(trk, 'gt_track_id', -1))
+                        if det_gt_id >= 0 and trk_gt_id >= 0:
+                            feature_dict = self._compute_l15_motion_reliability_features(
+                                trk,
+                                det,
+                                vel_sim=raw_vel_sim,
+                            )
+                            l15_sample_exporter.export({
+                                'seq_id': str(getattr(self.multi_frame_config, 'current_seq_id', 'unknown')),
+                                'frame': int(getattr(self.multi_frame_config, 'current_data_frame', self.current_frame)),
+                                'det_local_idx': int(d),
+                                'trk_local_idx': int(t),
+                                'track_id_3d': int(getattr(trk, 'track_id_3d', -1)),
+                                'det_gt_id': int(det_gt_id),
+                                'trk_gt_id': int(trk_gt_id),
+                                'label': int(det_gt_id == trk_gt_id),
+                                'winner_candidate': int(is_winner_candidate),
+                                'row_margin': None if np.isnan(row_margin) else float(row_margin),
+                                'provisional_score': float(provisional_score),
+                                'raw_vel_sim': float(raw_vel_sim),
+                                'effective_vel_sim': float(effective_vel_sim),
+                                'motion_reliability': float(motion_reliability_matrix[d, t]),
+                                'suppression_strength': float(suppression_strength),
+                                'feature_dict': feature_dict,
+                            })
 
             combined_matrix = self._compute_l15_combined_matrix(
-                velocity_matrix, position_matrix, detections, tracks, track_weights
+                velocity_matrix,
+                position_matrix,
+                detections,
+                tracks,
+                track_weights,
+                motion_reliability_matrix=motion_reliability_matrix if self.use_confidence_aware_motion_l15 else None,
             )
 
         row_top1_indices = np.argmax(combined_matrix, axis=1) if combined_matrix.size > 0 else np.array([], dtype=int)
@@ -1120,6 +1331,11 @@ class Tracker:
         self.additional_info = detection.additional_info
         pose = np.concatenate(self.kf_3d.kf.x[:7], axis=0)
         trk = Track_3D(pose, self.kf_3d, self.track_id_3d, self.n_init, self.max_age, self.additional_info, emb, init_frame=self.current_frame)
+        try:
+            trk.gt_track_id = int(getattr(detection, 'gt_track_id', -1))
+            trk.gt_class_name = str(getattr(detection, 'gt_class_name', ''))
+        except Exception:
+            pass
         trk.set_assoc_source(source_level, self.current_frame)
         self.tracks_3d.append(trk)
         self.track_id_3d += 2
@@ -1222,10 +1438,7 @@ class Tracker:
         
         return acceleration
 
-    def _compute_l15_motion_reliability(self, track, detection):
-        if not getattr(self, 'use_confidence_aware_motion_l15', False):
-            return 1.0
-
+    def _compute_l15_motion_reliability_features(self, track, detection, vel_sim=None):
         score = 1.0
         try:
             score = float(getattr(detection, 'score', 1.0))
@@ -1242,21 +1455,116 @@ class Tracker:
         except Exception:
             uncertainty = 0.0
 
-        logit = (
-            float(self.l15_motion_reliability_bias) +
-            float(self.l15_motion_reliability_score_gain) * (score - self.det_thresh) -
-            float(self.l15_motion_reliability_uncertainty_gain) * uncertainty
-        )
-        return float(1.0 / (1.0 + np.exp(-logit)))
+        tsu = 0.0
+        try:
+            tsu = max(0.0, min(1.0, float(getattr(track, 'time_since_update', 0)) / max(float(getattr(self, 'max_age', 1)), 1.0)))
+        except Exception:
+            tsu = 0.0
 
-    def _compute_l15_combined_matrix(self, motion_matrix, position_matrix, detections, tracks, track_weights):
+        beta = 1.0
+        try:
+            beta = max(0.0, min(1.0, float(getattr(track, 'beta_t', 1.0))))
+        except Exception:
+            beta = 1.0
+
+        hits = 0.0
+        try:
+            hits = max(0.0, min(1.0, float(getattr(track, 'hits', 0)) / max(float(getattr(self, 'n_init', 3)) + 2.0, 1.0)))
+        except Exception:
+            hits = 0.0
+
+        age = 0.0
+        try:
+            age = max(0.0, min(1.0, float(getattr(track, 'age', 0)) / max(float(getattr(self, 'max_age', 30)), 1.0)))
+        except Exception:
+            age = 0.0
+
+        speed = 0.0
+        try:
+            trk_vel = get_velocity(track)
+            speed = float(np.linalg.norm(np.asarray(trk_vel, dtype=np.float32)))
+            speed = max(0.0, min(1.0, speed / max(self.velocity_weight_vmax, 1e-6)))
+        except Exception:
+            speed = 0.0
+
+        pair_center_dist = 0.0
+        try:
+            det_box = np.asarray(detection.bbox, dtype=np.float32)
+            trk_box = np.asarray(track.pose, dtype=np.float32)
+            center_dist = float(np.linalg.norm(det_box[[0, 2]] - trk_box[[0, 2]]))
+            det_diag = float(np.hypot(max(det_box[4], 1e-3), max(det_box[5], 1e-3)))
+            trk_diag = float(np.hypot(max(trk_box[4], 1e-3), max(trk_box[5], 1e-3)))
+            scale_ref = max(0.5 * (det_diag + trk_diag), 1e-3)
+            pair_center_dist = max(0.0, min(1.0, center_dist / (2.5 * scale_ref)))
+        except Exception:
+            pair_center_dist = 0.0
+
+        vel_sim_value = 0.5
+        try:
+            if vel_sim is not None:
+                vel_sim_value = float(vel_sim)
+        except Exception:
+            vel_sim_value = 0.5
+
+        return MotionReliabilityCalibrator.build_feature_dict(
+            det_score=score,
+            track_uncertainty=uncertainty,
+            track_tsu=tsu,
+            track_beta=beta,
+            track_hits=hits,
+            track_age=age,
+            track_speed=speed,
+            pair_center_dist=pair_center_dist,
+            vel_sim=vel_sim_value,
+        )
+
+    def _compute_l15_motion_reliability(self, track, detection, vel_sim=None):
+        if not getattr(self, 'use_confidence_aware_motion_l15', False):
+            return 1.0
+        calibrator = self._get_l15_motion_reliability_calibrator()
+        features = self._compute_l15_motion_reliability_features(track, detection, vel_sim=vel_sim)
+        return float(calibrator.predict(features))
+
+    def _compute_l15_pair_adaptive_weights(self, base_w_vel, base_w_pos, motion_reliability):
+        base_w_vel = float(max(0.0, base_w_vel))
+        base_w_pos = float(max(0.0, base_w_pos))
+        total = base_w_vel + base_w_pos
+        if total <= 1e-6:
+            return 0.5, 0.5
+        base_w_vel /= total
+        base_w_pos /= total
+        if not getattr(self, 'enable_l15_reliability_pair_reweight', True):
+            return base_w_vel, base_w_pos
+        reliability = max(0.0, min(1.0, float(motion_reliability)))
+        strength = max(0.0, min(1.0, float(getattr(self, 'l15_reliability_pair_reweight_strength', 1.0))))
+        effective_reliability = (1.0 - strength) + strength * reliability
+        w_vel = base_w_vel * effective_reliability
+        transferred = base_w_vel - w_vel
+        w_pos = base_w_pos + transferred
+        norm = w_vel + w_pos
+        if norm <= 1e-6:
+            return 0.5, 0.5
+        return float(w_vel / norm), float(w_pos / norm)
+
+    def _compute_l15_combined_matrix(self, motion_matrix, position_matrix, detections, tracks, track_weights, motion_reliability_matrix=None):
         combined_matrix = np.zeros((len(detections), len(tracks)))
         for d in range(len(detections)):
             for t in range(len(tracks)):
                 w_vel_t, w_pos_t = track_weights[t]
+                motion_reliability = 1.0
+                if motion_reliability_matrix is not None:
+                    try:
+                        motion_reliability = float(motion_reliability_matrix[d, t])
+                    except Exception:
+                        motion_reliability = 1.0
+                w_vel_eff, w_pos_eff = self._compute_l15_pair_adaptive_weights(
+                    w_vel_t,
+                    w_pos_t,
+                    motion_reliability,
+                )
                 base_score = (
-                    w_vel_t * motion_matrix[d, t] +
-                    w_pos_t * position_matrix[d, t]
+                    w_vel_eff * motion_matrix[d, t] +
+                    w_pos_eff * position_matrix[d, t]
                 )
                 if self.use_rotated_geom_in_l15:
                     rotated_geom_sim = compute_rotated_ground_similarity(
@@ -1297,10 +1605,15 @@ class Tracker:
         detection,
         raw_vel_sim,
         effective_vel_sim,
+        position_sim,
         motion_reliability,
         suppression_applied,
         det_local_idx=None,
         trk_local_idx=None,
+        base_w_vel=None,
+        base_w_pos=None,
+        eff_w_vel=None,
+        eff_w_pos=None,
         combined_score=None,
         row_top1=None,
         col_top1=None,
@@ -1336,10 +1649,15 @@ class Tracker:
                     'detection': detection,
                     'raw_vel_sim': raw_vel_sim,
                     'effective_vel_sim': effective_vel_sim,
+                    'position_sim': position_sim,
                     'motion_reliability': motion_reliability,
                     'suppression_applied': suppression_applied,
                     'det_local_idx': det_local_idx,
                     'trk_local_idx': trk_local_idx,
+                    'base_w_vel': base_w_vel,
+                    'base_w_pos': base_w_pos,
+                    'eff_w_vel': eff_w_vel,
+                    'eff_w_pos': eff_w_pos,
                     'combined_score': combined_score,
                     'row_top1': row_top1,
                     'col_top1': col_top1,
@@ -1359,7 +1677,8 @@ class Tracker:
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(
                     '[L1.5 MotionDiag][{}] frame={} track_id={} score={:.6f} uncertainty={:.6f} '
-                    'motion_reliability={:.6f} raw_vel_sim={:.6f} effective_vel_sim={:.6f} '
+                    'motion_reliability={:.6f} raw_vel_sim={:.6f} effective_vel_sim={:.6f} position_sim={:.6f} '
+                    'base_w_vel={} base_w_pos={} eff_w_vel={} eff_w_pos={} '
                     'suppression_applied={} det_local_idx={} trk_local_idx={} combined_score={} '
                     'row_top1={} col_top1={} gate_pass={} provisional_score={} '
                     'winner_candidate={} row_margin={} suppression_strength={}\n'.format(
@@ -1371,6 +1690,11 @@ class Tracker:
                         float(motion_reliability),
                         float(raw_vel_sim),
                         float(effective_vel_sim),
+                        float(position_sim),
+                        'nan' if base_w_vel is None else '{:.6f}'.format(float(base_w_vel)),
+                        'nan' if base_w_pos is None else '{:.6f}'.format(float(base_w_pos)),
+                        'nan' if eff_w_vel is None else '{:.6f}'.format(float(eff_w_vel)),
+                        'nan' if eff_w_pos is None else '{:.6f}'.format(float(eff_w_pos)),
                         int(suppression_applied),
                         -1 if det_local_idx is None else int(det_local_idx),
                         -1 if trk_local_idx is None else int(trk_local_idx),

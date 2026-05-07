@@ -5,7 +5,17 @@ import math
 from tracking.cost_function import iou3d, convert_3dbox_to_8corner, iou_batch, eucliDistance
 import scipy.spatial as sp
 
-def compute_rotated_ground_similarity(det_box, trk_box, det_corners=None, trk_corners=None):
+def compute_rotated_ground_similarity(
+    det_box,
+    trk_box,
+    det_corners=None,
+    trk_corners=None,
+    bev_weight=1.0 / 3.0,
+    center_weight=1.0 / 3.0,
+    size_weight=1.0 / 3.0,
+    center_tau=1.0,
+    size_tau=1.0,
+):
     """
     Continuous ground-plane geometric similarity using the existing 3D boxes.
     This is a lightweight MCTrack-style replacement for plain 3D IoU scoring:
@@ -26,15 +36,31 @@ def compute_rotated_ground_similarity(det_box, trk_box, det_corners=None, trk_co
         det_diag = float(np.hypot(max(det_box[4], 1e-3), max(det_box[5], 1e-3)))
         trk_diag = float(np.hypot(max(trk_box[4], 1e-3), max(trk_box[5], 1e-3)))
         scale_ref = max(0.5 * (det_diag + trk_diag), 1e-3)
-        center_sim = float(np.exp(-center_dist / scale_ref))
+        center_tau = max(float(center_tau), 1e-6)
+        center_sim = float(np.exp(-center_dist / (center_tau * scale_ref)))
 
         size_delta = 0.5 * (
             abs(math.log(max(float(det_box[4]), 1e-3) / max(float(trk_box[4]), 1e-3))) +
             abs(math.log(max(float(det_box[5]), 1e-3) / max(float(trk_box[5]), 1e-3)))
         )
-        size_sim = float(np.exp(-size_delta))
+        size_tau = max(float(size_tau), 1e-6)
+        size_sim = float(np.exp(-size_tau * size_delta))
 
-        return float((bev_iou + center_sim + size_sim) / 3.0)
+        bev_weight = max(float(bev_weight), 0.0)
+        center_weight = max(float(center_weight), 0.0)
+        size_weight = max(float(size_weight), 0.0)
+        total_weight = bev_weight + center_weight + size_weight
+        if total_weight <= 1e-6:
+            bev_weight = center_weight = size_weight = 1.0 / 3.0
+            total_weight = 1.0
+
+        return float(
+            (
+                bev_weight * bev_iou +
+                center_weight * center_sim +
+                size_weight * size_sim
+            ) / total_weight
+        )
     except Exception:
         return 0.0
 
@@ -387,6 +413,7 @@ def associate_detections_to_trackers_fusion(
     det_app=False,
     appearance_weight=None,
     use_rotated_geom=False,
+    rotated_geom_params=None,
     risk_options=None,
     return_diagnostics=False,
 ):
@@ -490,6 +517,7 @@ def associate_detections_to_trackers_fusion(
             score_matrix = iou_matrix.copy()
             if use_rotated_geom and len(detections) > 0 and len(trackers) > 0:
                 geom_matrix = np.zeros_like(score_matrix, dtype=np.float32)
+                geom_cfg = rotated_geom_params or {}
                 for d_idx, det in enumerate(detections):
                     det_box = getattr(det, 'bbox', None)
                     det_corners = dets_8corner[d_idx]
@@ -501,6 +529,11 @@ def associate_detections_to_trackers_fusion(
                             trk_box,
                             det_corners=det_corners,
                             trk_corners=trk_corners,
+                            bev_weight=float(geom_cfg.get('bev_weight', 1.0 / 3.0)),
+                            center_weight=float(geom_cfg.get('center_weight', 1.0 / 3.0)),
+                            size_weight=float(geom_cfg.get('size_weight', 1.0 / 3.0)),
+                            center_tau=float(geom_cfg.get('center_tau', 1.0)),
+                            size_tau=float(geom_cfg.get('size_tau', 1.0)),
                         )
                 score_matrix = geom_matrix
             if not det_app and emb_cost is not None and emb_cost.size > 0:

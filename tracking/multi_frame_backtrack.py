@@ -8,6 +8,7 @@ import math
 import numpy as np
 from tracking.cost_function import get_velocity, compute_adaptive_weight_linear, estimate_detection_velocity, compute_velocity_similarity as compute_velocity_similarity_vec
 from tracking.matching import linear_assignment, compute_rotated_ground_similarity
+from tracking.motion_reliability import MotionReliabilityCalibrator
 
 
 class MultiFrameBacktrackConfig:
@@ -44,7 +45,22 @@ class MultiFrameBacktrackConfig:
         # 速度自适应参数
         self.vmax_for_adaptive_weight = 12.0
         # 协方差不确定性归一化尺度（m）
-        self.uncertainty_norm = 3.0
+        self.uncertainty_norm = 12.0
+        self.velocity_confidence_floor = 0.25
+        self.enable_confidence_aware_motion_l25 = True
+        self.l25_motion_reliability_mode = 'manual'
+        self.l25_motion_reliability_model_path = ''
+        self.l25_motion_reliability_feature_names = list(MotionReliabilityCalibrator.DEFAULT_FEATURES)
+        self.l25_motion_reliability_bias = -0.1
+        self.l25_motion_reliability_score_gain = 2.0
+        self.l25_motion_reliability_uncertainty_gain = 2.0
+        self.l25_velocity_share_min = 0.05
+        self.l25_velocity_share_max = 0.30
+        self.l25_velocity_geom_center = 0.30
+        self.l25_velocity_geom_gain = 10.0
+        self.l25_velocity_motion_center = 0.65
+        self.l25_velocity_motion_gain = 8.0
+        self.l25_velocity_reliability_strength = 0.60
         # 使用全局最优（线性分配）代替贪心
         self.use_global_assignment = True
         # 非线性回推开关（考虑加速度）
@@ -68,6 +84,7 @@ class MultiFrameBacktrackConfig:
         self.candidate_min_size_ratio = 0.55
         self.candidate_max_center_dist_base = 2.0
         self.candidate_max_center_dist_per_dt = 0.35
+        self.geometry_mode = 'box_iou'
         self.use_rotated_geom_in_l25 = False
         self.rotated_geom_weight_l25 = 0.10
         self.use_l25_memory_bank_appearance = False
@@ -77,6 +94,10 @@ class MultiFrameBacktrackConfig:
         self.enable_memory_bank_stats_log = False
         self.memory_bank_stats_log_path = None
         self.memory_bank_stats = None
+        self.enable_candidate_diag_log = False
+        self.candidate_diag_log_path = None
+        self._l25_motion_reliability_calibrator = None
+        self._l25_motion_reliability_signature = None
 
 
 def reset_memory_bank_stats(config):
@@ -134,6 +155,76 @@ def append_memory_bank_stats_log(config):
                     int(stats.get('ambiguous_rows', 0)),
                     int(stats.get('ambiguous_cols', 0)),
                     int(stats.get('rescored_pairs', 0)),
+                )
+            )
+    except Exception:
+        pass
+
+
+def _append_l25_candidate_diag_log(
+    config,
+    track,
+    detection,
+    detection_frame_id,
+    dt,
+    stage,
+    decision,
+    reason,
+    iou=None,
+    app_sim=None,
+    vel_sim=None,
+    decay=None,
+    uncertainty=None,
+    motion_reliability=None,
+    w_iou=None,
+    w_vel=None,
+    w_app=None,
+    vel_share=None,
+    vel_focus=None,
+    combined_sim=None,
+    cost=None,
+):
+    if config is None or not getattr(config, 'enable_candidate_diag_log', False):
+        return
+    log_path = getattr(config, 'candidate_diag_log_path', None)
+    if not log_path:
+        return
+    try:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        seq_id = getattr(config, 'current_seq_id', 'unknown')
+        curr_frame = getattr(config, 'current_data_frame', None)
+        curr_frame = -1 if curr_frame is None else int(curr_frame)
+        track_id = int(getattr(track, 'track_id_3d', -1))
+        det_score = float(getattr(detection, 'score', 1.0))
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                '[L2.5 CandidateDiag][{}] frame={} track_id={} det_frame={} dt={} stage={} decision={} reason={} '
+                'det_score={:.6f} iou={} app_sim={} vel_sim={} decay={} uncertainty={} motion_reliability={} '
+                'w_iou={} w_vel={} w_app={} vel_share={} vel_focus={} combined_sim={} cost={}\n'.format(
+                    seq_id,
+                    curr_frame,
+                    track_id,
+                    int(detection_frame_id),
+                    int(dt),
+                    str(stage),
+                    str(decision),
+                    str(reason),
+                    det_score,
+                    'nan' if iou is None else '{:.6f}'.format(float(iou)),
+                    'nan' if app_sim is None else '{:.6f}'.format(float(app_sim)),
+                    'nan' if vel_sim is None else '{:.6f}'.format(float(vel_sim)),
+                    'nan' if decay is None else '{:.6f}'.format(float(decay)),
+                    'nan' if uncertainty is None else '{:.6f}'.format(float(uncertainty)),
+                    'nan' if motion_reliability is None else '{:.6f}'.format(float(motion_reliability)),
+                    'nan' if w_iou is None else '{:.6f}'.format(float(w_iou)),
+                    'nan' if w_vel is None else '{:.6f}'.format(float(w_vel)),
+                    'nan' if w_app is None else '{:.6f}'.format(float(w_app)),
+                    'nan' if vel_share is None else '{:.6f}'.format(float(vel_share)),
+                    'nan' if vel_focus is None else '{:.6f}'.format(float(vel_focus)),
+                    'nan' if combined_sim is None else '{:.6f}'.format(float(combined_sim)),
+                    'nan' if cost is None else '{:.6f}'.format(float(cost)),
                 )
             )
     except Exception:
@@ -359,6 +450,29 @@ def compute_iou_3d(pose1, bbox2):
     return np.clip(iou, 0, 1)
 
 
+def _get_l25_geometry_mode(config):
+    mode = str(getattr(config, 'geometry_mode', 'box_iou')).strip().lower()
+    if mode in ('rotated', 'rotated_geom', 'rot_geom'):
+        return 'rotated_geom'
+    return 'box_iou'
+
+
+def _compute_l25_geometry_similarity(rollback_pose, det_bbox, config):
+    geom_mode = _get_l25_geometry_mode(config)
+    box_iou = compute_iou_3d(rollback_pose, det_bbox)
+
+    if geom_mode == 'rotated_geom':
+        geom_sim = compute_rotated_ground_similarity(det_bbox, rollback_pose)
+        return float(np.clip(geom_sim, 0.0, 1.0)), float(np.clip(box_iou, 0.0, 1.0)), geom_mode
+
+    geom_sim = box_iou
+    if getattr(config, 'use_rotated_geom_in_l25', False):
+        rotated_geom_sim = compute_rotated_ground_similarity(det_bbox, rollback_pose)
+        geom_w = max(0.0, min(1.0, float(getattr(config, 'rotated_geom_weight_l25', 0.10))))
+        geom_sim = (1.0 - geom_w) * geom_sim + geom_w * rotated_geom_sim
+    return float(np.clip(geom_sim, 0.0, 1.0)), float(np.clip(box_iou, 0.0, 1.0)), geom_mode
+
+
 def compute_velocity_similarity(track, detection):
     """
     计算速度相似度
@@ -470,16 +584,151 @@ def compute_memory_bank_appearance_details(track, detection):
     return float(mem_sim), float(base_sim), True
 
 
-def _build_l25_cost(iou, vel_sim, app_sim, track, config, w_vel_t, uncertainty, decay):
+def _compute_l25_uncertainty(track, config):
+    try:
+        P = track.kf_3d.kf.P
+        sx = float(np.sqrt(np.abs(P[0, 0]))) if P.shape[0] > 0 else 0.0
+        sz = float(np.sqrt(np.abs(P[2, 2]))) if P.shape[0] > 2 else 0.0
+        raw_uncertainty = max(0.0, sx + sz)
+        u_norm = max(float(getattr(config, 'uncertainty_norm', 12.0)), 1e-6)
+        uncertainty = 1.0 - math.exp(-raw_uncertainty / u_norm)
+        return max(0.0, min(1.0, float(uncertainty)))
+    except Exception:
+        return 0.0
+
+
+def _safe_sigmoid(x):
+    x = np.clip(float(x), -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _clip01(x):
+    return float(np.clip(float(x), 0.0, 1.0))
+
+
+def _get_l25_motion_reliability_calibrator(config):
+    if config is None:
+        return None
+    signature = (
+        bool(getattr(config, 'enable_confidence_aware_motion_l25', False)),
+        str(getattr(config, 'l25_motion_reliability_mode', 'manual')).strip().lower(),
+        str(getattr(config, 'l25_motion_reliability_model_path', '') or '').strip(),
+        float(getattr(config, 'l25_motion_reliability_bias', -0.1)),
+        float(getattr(config, 'l25_motion_reliability_score_gain', 2.0)),
+        float(getattr(config, 'l25_motion_reliability_uncertainty_gain', 2.0)),
+        tuple(getattr(config, 'l25_motion_reliability_feature_names', MotionReliabilityCalibrator.DEFAULT_FEATURES)),
+    )
+    if getattr(config, '_l25_motion_reliability_calibrator', None) is not None and getattr(config, '_l25_motion_reliability_signature', None) == signature:
+        return config._l25_motion_reliability_calibrator
+    config._l25_motion_reliability_calibrator = MotionReliabilityCalibrator(
+        mode=getattr(config, 'l25_motion_reliability_mode', 'manual'),
+        manual_bias=getattr(config, 'l25_motion_reliability_bias', -0.1),
+        manual_score_gain=getattr(config, 'l25_motion_reliability_score_gain', 2.0),
+        manual_uncertainty_gain=getattr(config, 'l25_motion_reliability_uncertainty_gain', 2.0),
+        feature_names=getattr(config, 'l25_motion_reliability_feature_names', MotionReliabilityCalibrator.DEFAULT_FEATURES),
+        weight_path=getattr(config, 'l25_motion_reliability_model_path', ''),
+    )
+    config._l25_motion_reliability_signature = signature
+    return config._l25_motion_reliability_calibrator
+
+
+def _compute_l25_motion_reliability(track, detection, rollback_pose, vel_sim, uncertainty, config):
+    if config is None or not getattr(config, 'enable_confidence_aware_motion_l25', False):
+        return 1.0
+
+    try:
+        det_score = _clip01(getattr(detection, 'score', 1.0))
+    except Exception:
+        det_score = 1.0
+    try:
+        track_tsu = _clip01(float(getattr(track, 'time_since_update', 0)) / max(float(getattr(config, 'max_backtrack_age', 15)), 1.0))
+    except Exception:
+        track_tsu = 0.0
+    try:
+        track_beta = _clip01(float(getattr(track, 'beta_t', 1.0)))
+    except Exception:
+        track_beta = 1.0
+    try:
+        track_hits = _clip01(float(getattr(track, 'hits', 0)) / 8.0)
+    except Exception:
+        track_hits = 0.0
+    try:
+        track_age = _clip01(float(getattr(track, 'age', 0)) / 30.0)
+    except Exception:
+        track_age = 0.0
+    try:
+        track_speed = _clip01(float(np.linalg.norm(np.asarray(get_velocity(track), dtype=np.float32))) / max(float(getattr(config, 'vmax_for_adaptive_weight', 12.0)), 1e-6))
+    except Exception:
+        track_speed = 0.0
+
+    pair_center_dist = 0.0
+    try:
+        det_box = np.asarray(detection.bbox, dtype=np.float32)
+        trk_box = np.asarray(rollback_pose, dtype=np.float32)
+        center_dist = float(np.linalg.norm(det_box[[0, 2]] - trk_box[[0, 2]]))
+        det_diag = float(np.hypot(max(det_box[4], 1e-3), max(det_box[5], 1e-3)))
+        trk_diag = float(np.hypot(max(trk_box[4], 1e-3), max(trk_box[5], 1e-3)))
+        scale_ref = max(0.5 * (det_diag + trk_diag), 1e-3)
+        pair_center_dist = _clip01(center_dist / (2.5 * scale_ref))
+    except Exception:
+        pair_center_dist = 0.0
+
+    features = MotionReliabilityCalibrator.build_feature_dict(
+        det_score=det_score,
+        track_uncertainty=uncertainty,
+        track_tsu=track_tsu,
+        track_beta=track_beta,
+        track_hits=track_hits,
+        track_age=track_age,
+        track_speed=track_speed,
+        pair_center_dist=pair_center_dist,
+        vel_sim=vel_sim,
+    )
+    calibrator = _get_l25_motion_reliability_calibrator(config)
+    if calibrator is None:
+        return 1.0
+    return _clip01(calibrator.predict(features))
+
+
+def _compute_l25_weight_terms(track, geom_sim, vel_sim, app_sim, motion_reliability, config, w_vel_t, uncertainty):
     cap = 0.25 if getattr(track, 'time_since_update', 0) >= 3 else 0.22
     base_app = min(max(getattr(config, 'appearance_weight', 0.2), 0.0), cap)
     reliable = (app_sim >= 0.6)
     w_app = base_app if reliable else min(0.05, base_app)
     residual = max(0.0, 1.0 - w_app)
-    w_vel = residual * w_vel_t * (1.0 - uncertainty)
-    w_vel = max(0.1, w_vel)
-    w_vel = min(w_vel, residual)
+
+    state_floor = _clip01(getattr(config, 'velocity_confidence_floor', 0.25))
+    state_conf = _clip01(state_floor + (1.0 - state_floor) * (1.0 - _clip01(uncertainty)))
+
+    geom_focus = _safe_sigmoid(
+        float(getattr(config, 'l25_velocity_geom_gain', 10.0)) *
+        (_clip01(geom_sim) - float(getattr(config, 'l25_velocity_geom_center', 0.30)))
+    )
+    motion_focus = _safe_sigmoid(
+        float(getattr(config, 'l25_velocity_motion_gain', 8.0)) *
+        (_clip01(vel_sim) - float(getattr(config, 'l25_velocity_motion_center', 0.55)))
+    )
+    vel_focus = math.sqrt(max(0.0, geom_focus * motion_focus))
+    speed_prior = _clip01(w_vel_t)
+    candidate_value = _clip01(0.50 * vel_focus + 0.35 * speed_prior + 0.15 * _clip01(geom_sim))
+
+    vel_share_min = _clip01(getattr(config, 'l25_velocity_share_min', 0.05))
+    vel_share_max = max(vel_share_min, _clip01(getattr(config, 'l25_velocity_share_max', 0.38)))
+    base_vel_share = vel_share_min + (vel_share_max - vel_share_min) * candidate_value
+
+    reliability_strength = _clip01(getattr(config, 'l25_velocity_reliability_strength', 0.85))
+    reliability_gate = _clip01((1.0 - reliability_strength) + reliability_strength * _clip01(motion_reliability))
+    effective_vel_share = _clip01(base_vel_share * math.sqrt(max(0.0, state_conf * reliability_gate)))
+
+    w_vel = min(residual * effective_vel_share, residual)
     w_iou = max(0.0, residual - w_vel)
+    return float(w_iou), float(w_vel), float(w_app), float(effective_vel_share), float(vel_focus)
+
+
+def _build_l25_cost(iou, vel_sim, app_sim, motion_reliability, track, config, w_vel_t, uncertainty, decay):
+    w_iou, w_vel, w_app, _, _ = _compute_l25_weight_terms(
+        track, iou, vel_sim, app_sim, motion_reliability, config, w_vel_t, uncertainty
+    )
     combined_sim = w_iou * iou + w_vel * vel_sim + w_app * app_sim
     return float(-(combined_sim * decay))
 
@@ -517,6 +766,42 @@ def _passes_l25_candidate_pre_gate(rollback_pose, det_bbox, iou, dt, config):
         return False
 
     return True
+
+
+def _get_l25_candidate_pre_gate_failure_reason(rollback_pose, det_bbox, iou, dt, config):
+    if config is None or not getattr(config, 'enable_candidate_pre_gate', True):
+        return None
+
+    min_iou = float(getattr(config, 'candidate_min_iou', 0.03))
+    if float(iou) < min_iou:
+        return 'pre_gate_iou'
+
+    try:
+        trk_center = np.asarray(rollback_pose[:3], dtype=np.float32)
+        det_center = np.asarray(det_bbox[:3], dtype=np.float32)
+        center_dist = float(np.linalg.norm(trk_center[[0, 2]] - det_center[[0, 2]]))
+    except Exception:
+        center_dist = float('inf')
+
+    max_center_dist = (
+        float(getattr(config, 'candidate_max_center_dist_base', 2.0)) +
+        max(0.0, float(dt) - 1.0) * float(getattr(config, 'candidate_max_center_dist_per_dt', 0.35))
+    )
+    if center_dist > max_center_dist:
+        return 'pre_gate_center_dist'
+
+    try:
+        trk_size = np.maximum(np.asarray(rollback_pose[4:7], dtype=np.float32), 1e-6)
+        det_size = np.maximum(np.asarray(det_bbox[4:7], dtype=np.float32), 1e-6)
+        size_ratio = float(np.min(np.minimum(trk_size, det_size) / np.maximum(trk_size, det_size)))
+    except Exception:
+        size_ratio = 0.0
+
+    min_size_ratio = float(getattr(config, 'candidate_min_size_ratio', 0.55))
+    if size_ratio < min_size_ratio:
+        return 'pre_gate_size_ratio'
+
+    return None
 
 
 def compute_decay_cost_matrix(track, detection_buffer, current_frame, 
@@ -559,16 +844,20 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
             use_nonlinear = getattr(config, 'use_nonlinear_backtrack', True)
             rollback_pose = get_pose_at_past_frame(track, dt, use_nonlinear=use_nonlinear, config=config)
             decay = compute_decay_factor(dt, config.lambda_decay)
-            iou = compute_iou_3d(rollback_pose, det.bbox)
-            if iou <= 1e-6:
+            geom_sim, gate_iou, _ = _compute_l25_geometry_similarity(rollback_pose, det.bbox, config)
+            if gate_iou <= 1e-6:
+                _append_l25_candidate_diag_log(config, track, det, fid, dt, 'single', 'reject', 'iou_zero', iou=geom_sim, decay=decay)
                 continue
-            if not _passes_l25_candidate_pre_gate(rollback_pose, det.bbox, iou, dt, config):
+            pre_gate_reason = _get_l25_candidate_pre_gate_failure_reason(rollback_pose, det.bbox, gate_iou, dt, config)
+            if pre_gate_reason is not None:
+                _append_l25_candidate_diag_log(config, track, det, fid, dt, 'single', 'reject', pre_gate_reason, iou=geom_sim, decay=decay)
                 continue
             if getattr(config, 'use_l25_memory_bank_appearance', False):
                 app_sim = compute_memory_bank_appearance_similarity(track, det)
             else:
                 app_sim = compute_appearance_similarity(track, det)
             if app_sim < getattr(config, 'appearance_hard_gate', 0.6):
+                _append_l25_candidate_diag_log(config, track, det, fid, dt, 'single', 'reject', 'appearance_hard_gate', iou=geom_sim, app_sim=app_sim, decay=decay)
                 continue
             det_vel = estimate_detection_velocity(det, detection_buffer, fid)
             trk_vel = get_velocity(track)
@@ -580,28 +869,25 @@ def compute_decay_cost_matrix(track, detection_buffer, current_frame,
             reliable = (app_sim >= 0.6)
             w_app = base_app if reliable else min(0.05, base_app)
             residual = max(0.0, 1.0 - w_app)
-            # 速度/位置残差分配 + 协方差不确定性抑制速度
             vmax = getattr(config, 'vmax_for_adaptive_weight', 10.0)
-            w_vel_t, w_pos_t = compute_adaptive_weight_linear(get_velocity(track), v_max=vmax)
-            # 估计不确定性: 取x/z方差
-            uncertainty = 0.0
-            try:
-                P = track.kf_3d.kf.P
-                sx = float(np.sqrt(np.abs(P[0, 0]))) if P.shape[0] > 0 else 0.0
-                sz = float(np.sqrt(np.abs(P[2, 2]))) if P.shape[0] > 2 else 0.0
-                u_norm = getattr(config, 'uncertainty_norm', 3.0)
-                uncertainty = max(0.0, min(1.0, (sx + sz) / max(u_norm, 1e-6)))
-            except Exception:
-                uncertainty = 0.0
-            w_vel = residual * w_vel_t * (1.0 - uncertainty)
-            # 速度权重下限
-            w_vel = max(0.1, w_vel)
-            w_vel = min(w_vel, residual)
-            w_iou = max(0.0, residual - w_vel)
-            # 融合相似度并应用时间衰减
-            combined_sim = w_iou * iou + w_vel * vel_sim + w_app * app_sim
+            w_vel_t, _ = compute_adaptive_weight_linear(get_velocity(track), v_max=vmax)
+            uncertainty = _compute_l25_uncertainty(track, config)
+            motion_reliability = _compute_l25_motion_reliability(
+                track, det, rollback_pose, vel_sim, uncertainty, config
+            )
+            w_iou, w_vel, w_app, vel_share, vel_focus = _compute_l25_weight_terms(
+                track, geom_sim, vel_sim, app_sim, motion_reliability, config, w_vel_t, uncertainty
+            )
+            combined_sim = w_iou * geom_sim + w_vel * vel_sim + w_app * app_sim
             decayed_sim = combined_sim * decay
             cost = -decayed_sim
+            _append_l25_candidate_diag_log(
+                config, track, det, fid, dt, 'single', 'keep', 'candidate',
+                iou=geom_sim, app_sim=app_sim, vel_sim=vel_sim, decay=decay,
+                uncertainty=uncertainty, motion_reliability=motion_reliability,
+                w_iou=w_iou, w_vel=w_vel, w_app=w_app, vel_share=vel_share, vel_focus=vel_focus,
+                combined_sim=combined_sim, cost=cost,
+            )
             per_frame.append((fid, det, cost, dt, decay))
         # 帧内取top-k
         if len(per_frame) > 0:
@@ -683,14 +969,18 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                 use_nonlinear = getattr(config, 'use_nonlinear_backtrack', True)
                 rollback_pose = get_pose_at_past_frame(track, dt, use_nonlinear=use_nonlinear, config=config)
                 decay = compute_decay_factor(dt, config.lambda_decay)
-                iou = compute_iou_3d(rollback_pose, det.bbox)
-                if iou <= 1e-6:
+                geom_sim, gate_iou, _ = _compute_l25_geometry_similarity(rollback_pose, det.bbox, config)
+                if gate_iou <= 1e-6:
+                    _append_l25_candidate_diag_log(config, track, det, fid, dt, 'global', 'reject', 'iou_zero', iou=geom_sim, decay=decay)
                     continue
-                if not _passes_l25_candidate_pre_gate(rollback_pose, det.bbox, iou, dt, config):
+                pre_gate_reason = _get_l25_candidate_pre_gate_failure_reason(rollback_pose, det.bbox, gate_iou, dt, config)
+                if pre_gate_reason is not None:
+                    _append_l25_candidate_diag_log(config, track, det, fid, dt, 'global', 'reject', pre_gate_reason, iou=geom_sim, decay=decay)
                     continue
 
                 base_app_sim = compute_appearance_similarity(track, det)
                 if base_app_sim < getattr(config, 'appearance_hard_gate', 0.6):
+                    _append_l25_candidate_diag_log(config, track, det, fid, dt, 'global', 'reject', 'appearance_hard_gate', iou=geom_sim, app_sim=base_app_sim, decay=decay)
                     continue
 
                 det_vel = estimate_detection_velocity(det, detection_buffer, fid)
@@ -698,32 +988,43 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                 vel_sim = compute_velocity_similarity_vec(trk_vel, det_vel)
                 vmax = getattr(config, 'vmax_for_adaptive_weight', 10.0)
                 w_vel_t, _ = compute_adaptive_weight_linear(get_velocity(track), v_max=vmax)
-                uncertainty = 0.0
-                try:
-                    P = track.kf_3d.kf.P
-                    sx = float(np.sqrt(np.abs(P[0, 0]))) if P.shape[0] > 0 else 0.0
-                    sz = float(np.sqrt(np.abs(P[2, 2]))) if P.shape[0] > 2 else 0.0
-                    u_norm = getattr(config, 'uncertainty_norm', 3.0)
-                    uncertainty = max(0.0, min(1.0, (sx + sz) / max(u_norm, 1e-6)))
-                except Exception:
-                    uncertainty = 0.0
+                uncertainty = _compute_l25_uncertainty(track, config)
+                motion_reliability = _compute_l25_motion_reliability(
+                    track, det, rollback_pose, vel_sim, uncertainty, config
+                )
 
                 base_cost = _build_l25_cost(
-                    iou=iou,
+                    iou=geom_sim,
                     vel_sim=vel_sim,
                     app_sim=float(base_app_sim),
+                    motion_reliability=motion_reliability,
                     track=track,
                     config=config,
                     w_vel_t=w_vel_t,
                     uncertainty=uncertainty,
                     decay=decay,
                 )
-                if getattr(config, 'use_rotated_geom_in_l25', False):
-                    rotated_geom_sim = compute_rotated_ground_similarity(det.bbox, rollback_pose)
-                    geom_w = max(0.0, min(1.0, float(getattr(config, 'rotated_geom_weight_l25', 0.10))))
-                    base_cost -= geom_w * rotated_geom_sim
+                w_iou, w_vel, w_app, vel_share, vel_focus = _compute_l25_weight_terms(
+                    track, geom_sim, vel_sim, base_app_sim, motion_reliability, config, w_vel_t, uncertainty
+                )
+                combined_sim = w_iou * geom_sim + w_vel * vel_sim + w_app * base_app_sim
                 if base_cost >= config.cost_threshold:
+                    _append_l25_candidate_diag_log(
+                        config, track, det, fid, dt, 'global', 'reject', 'cost_threshold',
+                        iou=geom_sim, app_sim=base_app_sim, vel_sim=vel_sim, decay=decay,
+                        uncertainty=uncertainty, motion_reliability=motion_reliability,
+                        w_iou=w_iou, w_vel=w_vel, w_app=w_app, vel_share=vel_share, vel_focus=vel_focus,
+                        combined_sim=combined_sim, cost=base_cost,
+                    )
                     continue
+
+                _append_l25_candidate_diag_log(
+                    config, track, det, fid, dt, 'global', 'keep', 'cost_valid',
+                    iou=geom_sim, app_sim=base_app_sim, vel_sim=vel_sim, decay=decay,
+                    uncertainty=uncertainty, motion_reliability=motion_reliability,
+                    w_iou=w_iou, w_vel=w_vel, w_app=w_app, vel_share=vel_share, vel_focus=vel_focus,
+                    combined_sim=combined_sim, cost=base_cost,
+                )
 
                 C_base[j, i] = base_cost
                 C[j, i] = base_cost
@@ -739,9 +1040,10 @@ def multi_frame_backtrack_association(unmatched_tracks, detection_buffer,
                             memory_bank_stats['pairs_app_changed'] += 1
                     if used_memory_bank_pair and mem_app_sim >= getattr(config, 'appearance_hard_gate', 0.6):
                         mem_cost = _build_l25_cost(
-                            iou=iou,
+                            iou=geom_sim,
                             vel_sim=vel_sim,
                             app_sim=float(mem_app_sim),
+                            motion_reliability=motion_reliability,
                             track=track,
                             config=config,
                             w_vel_t=w_vel_t,

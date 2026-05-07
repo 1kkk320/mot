@@ -66,6 +66,8 @@ class Track_3D:
         self.heading_history = [(init_frame, self.fused_heading)]
         self.last_assoc_level = 'INIT'
         self.last_assoc_frame = int(init_frame)
+        self.gt_track_id = -1
+        self.gt_class_name = ''
         
         # ========== 方案3: 多帧回溯 - 速度历史 ==========
         self.velocity_history = []  # [(frame_id, velocity), ...]
@@ -105,6 +107,13 @@ class Track_3D:
         self.kf_3d.update(detection_3d.bbox)
         self.additional_info = detection_3d.additional_info
         self.pose = np.concatenate(self.kf_3d.kf.x[:7], axis=0)
+        try:
+            det_gt_track_id = int(getattr(detection_3d, 'gt_track_id', -1))
+            if det_gt_track_id >= 0:
+                self.gt_track_id = det_gt_track_id
+                self.gt_class_name = str(getattr(detection_3d, 'gt_class_name', ''))
+        except Exception:
+            pass
         self.hits += 1
         self.age += 1
         self.time_since_update = 0

@@ -5,6 +5,7 @@ from os.path import join
 from file_operation.file import load_list_from_folder, mkdir_if_inexistence, fileparts
 from detection.detection import Detection_2D, Detection_3D_only, Detection_3D_Fusion
 from tracking.tracker import Tracker
+from tracking.motion_reliability import load_kitti_tracking_gt_by_frame, assign_detection_gt_ids
 from datasets.datafusion import datafusion2Dand3D
 from datasets.coordinate_transformation import convert_3dbox_to_8corner, convert_x1y1x2y2_to_tlwh
 from visualization.visualization_3d import show_image_with_boxes
@@ -97,6 +98,56 @@ def get_l12_defer_preset():
     if preset_name not in presets:
         print(f"[L1 DeferPreset] Unknown preset '{preset_name}', fallback to 'current'")
     return preset
+
+
+def get_l25_geometry_mode():
+    mode = os.getenv('L25_GEOMETRY_MODE', 'box_iou').strip().lower()
+    aliases = {
+        'box': 'box_iou',
+        'box_iou': 'box_iou',
+        'iou': 'box_iou',
+        'rotated': 'rotated_geom',
+        'rotated_geom': 'rotated_geom',
+        'rot_geom': 'rotated_geom',
+    }
+    resolved = aliases.get(mode, 'box_iou')
+    if mode not in aliases:
+        print(f"[L2.5 Geometry] Unknown mode '{mode}', fallback to 'box_iou'")
+    return resolved
+
+
+def get_env_flag(name, default='0'):
+    return os.getenv(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def get_env_int(name, default=None):
+    raw = os.getenv(name, '').strip()
+    if raw == '':
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def get_env_list(name):
+    raw = os.getenv(name, '').strip()
+    if raw == '':
+        return None
+    items = [item.strip() for item in raw.split(',') if item.strip()]
+    return set(items) if items else None
+
+
+def _normalize_triplet_weights(bev_weight, center_weight, size_weight):
+    bev_weight = max(float(bev_weight), 0.0)
+    center_weight = max(float(center_weight), 0.0)
+    size_weight = max(float(size_weight), 0.0)
+    total = bev_weight + center_weight + size_weight
+    if total <= 1e-6:
+        return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0
+    return bev_weight / total, center_weight / total, size_weight / total
+
+
 def get_tracker_output_name(data_root):
     parts = set(os.path.normpath(data_root).split(os.sep))
     if 'test' in parts or 'testing' in parts:
@@ -131,6 +182,7 @@ class DeepFusion(object):
         self.reorder_back = [6, 5, 4, 0, 1, 2, 3]
         self.frame_count = 0
         self.iou_shreshold = iou_shreshold
+        self.current_gt_frame_entries = []
 
     def update(self,detection_3D_fusion,detection_2D_only,detection_3D_only,detection_3Dto2D_only,
                additional_info, calib_file,img,detection_2D_only_conf, detection_3D_fusion_conf):
@@ -152,6 +204,9 @@ class DeepFusion(object):
         detection_3D_fusion = [Detection_3D_Fusion(det_fusion, dets_3d_fusion_info[i]) for i, det_fusion in enumerate(dets_3d_fusion)]
         detection_3D_only = [Detection_3D_only(det_only, dets_3d_only_info[i]) for i, det_only in enumerate(dets_3d_only)]
         detection_2D_only = [Detection_2D(det_fusion) for i, det_fusion in enumerate(detection_2D_only)]
+        if self.current_gt_frame_entries:
+            assign_detection_gt_ids(detection_3D_fusion, self.current_gt_frame_entries, min_iou=0.5)
+            assign_detection_gt_ids(detection_3D_only, self.current_gt_frame_entries, min_iou=0.5)
 
         self.tracker.predict_2d()
         self.tracker.predict_3d()
@@ -219,8 +274,9 @@ def main():
     l15_risk_preset = get_l15_selective_risk_preset()
     l15_weight_preset = get_l15_motion_position_weight_preset()
     l12_defer_preset = get_l12_defer_preset()
+    l25_geometry_mode = get_l25_geometry_mode()
     # Define the file name
-    data_root = 'datasets/kitti/test'
+    data_root = 'datasets/kitti/train'
     detections_name_3D = '3D_virconv'  
     detections_name_2D = '2D_rrc_Car'  
 
@@ -259,13 +315,33 @@ def main():
     tracker = DeepFusion(max_age=25, min_hits=3, iou_shreshold=0.22)
     
     # 保持外观权重
-    tracker.tracker.appearance_weight_level1 = 0.10
+    tracker.tracker.appearance_weight_level1 = float(os.getenv('L12_APPEARANCE_WEIGHT', '0.10'))
 
     # ========== 关闭航向角创新点 ==========
-    tracker.tracker.use_rotated_geom_in_l1 = True
-    tracker.tracker.use_rotated_geom_in_l2 = True
-    tracker.tracker.use_rotated_geom_in_l15 = True
-    tracker.tracker.rotated_geom_weight_l15 = 0.20
+    enable_l12_geom = get_env_flag('ENABLE_L12_GEOM', '1')
+    enable_motion_rel = get_env_flag('ENABLE_MOTION_REL', '1')
+    enable_l4_takeover = get_env_flag('ENABLE_L4_TAKEOVER', '1')
+    # Paper-style ablation semantics:
+    # - L1/L2 is always the base trunk.
+    # - "MotionRel" denotes the whole L1.5/L2.5 recovery branch rather than
+    #   only a small reweighting sub-switch inside an always-on branch.
+    # - L4 base association remains active; ENABLE_L4_TAKEOVER only controls
+    #   whether identity takeover is allowed after a valid L4 match.
+    enable_recovery_branch = enable_motion_rel
+    tracker.tracker.use_rotated_geom_in_l1 = enable_l12_geom
+    tracker.tracker.use_rotated_geom_in_l2 = enable_l12_geom
+    tracker.tracker.use_rotated_geom_in_l15 = enable_recovery_branch
+    tracker.tracker.rotated_geom_weight_l15 = float(os.getenv('L15_ROTATED_GEOM_WEIGHT', '0.20'))
+    bev_w, center_w, size_w = _normalize_triplet_weights(
+        os.getenv('L12_ROT_GEOM_BEV_WEIGHT', '0.333333'),
+        os.getenv('L12_ROT_GEOM_CENTER_WEIGHT', '0.333333'),
+        os.getenv('L12_ROT_GEOM_SIZE_WEIGHT', '0.333333'),
+    )
+    tracker.tracker.l12_rotated_geom_bev_weight = bev_w
+    tracker.tracker.l12_rotated_geom_center_weight = center_w
+    tracker.tracker.l12_rotated_geom_size_weight = size_w
+    tracker.tracker.l12_rotated_geom_center_tau = float(os.getenv('L12_ROT_GEOM_CENTER_TAU', '1.0'))
+    tracker.tracker.l12_rotated_geom_size_tau = float(os.getenv('L12_ROT_GEOM_SIZE_TAU', '1.0'))
     tracker.tracker.enable_l12_risk_model = True
     tracker.tracker.enable_l12_risk_tempering = False
     tracker.tracker.enable_l1_deferred_commitment = True
@@ -276,10 +352,21 @@ def main():
     tracker.tracker.l12_risk_app_rescue = 0.06
     tracker.tracker.l12_defer_threshold = l12_defer_preset['defer_threshold']
     tracker.tracker.l12_defer_identity_floor = l12_defer_preset['identity_floor']
-    print('[Association Config] RotGeom(L1={}, L2={})'.format(
+    print('[Association Config] RotGeom(L1={}, L2={}) weights=({:.3f},{:.3f},{:.3f}) taus=({:.3f},{:.3f})'.format(
         tracker.tracker.use_rotated_geom_in_l1,
         tracker.tracker.use_rotated_geom_in_l2,
+        tracker.tracker.l12_rotated_geom_bev_weight,
+        tracker.tracker.l12_rotated_geom_center_weight,
+        tracker.tracker.l12_rotated_geom_size_weight,
+        tracker.tracker.l12_rotated_geom_center_tau,
+        tracker.tracker.l12_rotated_geom_size_tau,
     ))
+    print(
+        '[Association Weight] appearance_l12={} rotated_geom_l15={}'.format(
+            tracker.tracker.appearance_weight_level1,
+            tracker.tracker.rotated_geom_weight_l15,
+        )
+    )
     print(
         '[L1/L2 RiskModel] enabled={} tempering={} defer_l1={} defer_l2={} margin_center={}'.format(
             tracker.tracker.enable_l12_risk_model,
@@ -309,7 +396,7 @@ def main():
     tracker.tracker.adaptive_threshold_high = 0.70  # 0.70
 
     # ========== 仅打开 L1.5 速度回溯 ==========
-    tracker.tracker.velocity_backtrack_enabled = True
+    tracker.tracker.velocity_backtrack_enabled = enable_recovery_branch
     tracker.tracker.velocity_threshold = 0.6  # 速度相似度阈值
     tracker.tracker.adaptive_weight = True  # 启用自适应速度权重
     tracker.tracker.l15_use_fixed_motion_position_weights = True
@@ -320,18 +407,24 @@ def main():
     tracker.tracker.use_smooth_velocity = True  # 启用速度平滑
     tracker.tracker.velocity_smooth_window = 3  # 速度平滑窗口
     tracker.tracker.trend_weight = 0.3  # 趋势权重
-    tracker.tracker.use_confidence_aware_motion_l15 = True
+    tracker.tracker.use_confidence_aware_motion_l15 = enable_recovery_branch
+    tracker.tracker.l15_motion_reliability_mode = os.getenv('L15_MOTION_RELIABILITY_MODE', 'manual').strip().lower()
+    tracker.tracker.l15_motion_reliability_model_path = os.getenv('L15_MOTION_RELIABILITY_MODEL', '').strip()
+    tracker.tracker.enable_l15_motion_sample_export = os.getenv('EXPORT_L15_MOTION_SAMPLES', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+    tracker.tracker.l15_motion_sample_export_path = os.getenv('L15_MOTION_SAMPLE_EXPORT_PATH', os.path.join('logs', 'l15_motion_reliability_samples.jsonl')).strip()
     tracker.tracker.l15_motion_reliability_bias = -0.2
     tracker.tracker.l15_motion_reliability_score_gain = 2.5
     tracker.tracker.l15_motion_reliability_uncertainty_gain = 2.0
     tracker.tracker.l15_motion_reliability_neutral = 0.5
+    tracker.tracker.enable_l15_reliability_pair_reweight = enable_recovery_branch and os.getenv('L15_RELIABILITY_PAIR_REWEIGHT', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    tracker.tracker.l15_reliability_pair_reweight_strength = float(os.getenv('L15_RELIABILITY_PAIR_REWEIGHT_STRENGTH', '1.0'))
     tracker.tracker.l15_motion_v4_high_sim_threshold = 0.8
     tracker.tracker.l15_motion_v4_raw_focus_gain = 10.0
     tracker.tracker.l15_motion_v4_gate_focus_gain = l15_risk_preset['gate_focus_gain']
     tracker.tracker.l15_motion_v4_margin_center = l15_risk_preset['margin_center']
     tracker.tracker.l15_motion_v4_margin_gain = l15_risk_preset['margin_gain']
     tracker.tracker.l15_motion_v4_min_effect = l15_risk_preset['min_effect']
-    tracker.tracker.enable_l15_motion_diag_log = True
+    tracker.tracker.enable_l15_motion_diag_log = enable_recovery_branch
     tracker.tracker.l15_motion_diag_log_path = os.path.join(
         'logs', f"l15_motion_diag_{l15_risk_preset['name']}_{l15_weight_preset['name']}.log"
     )
@@ -353,7 +446,7 @@ def main():
     )
     
     # ========== 基线：关闭 L2.5 多帧回溯 ==========
-    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = True
+    tracker.tracker.multi_frame_config.enable_multi_frame_backtrack = enable_recovery_branch
     tracker.tracker.multi_frame_config.min_backtrack_age = 4  # 最小回溯年龄
     tracker.tracker.multi_frame_config.max_backtrack_age = 15  # 最大回溯年龄
     tracker.tracker.multi_frame_config.lambda_decay = 0.15  # 时间衰减系数
@@ -363,8 +456,24 @@ def main():
     tracker.tracker.multi_frame_config.topk_per_frame = 1  # 每帧top-k
     tracker.tracker.multi_frame_config.appearance_weight = 0.2  # 外观权重
     tracker.tracker.multi_frame_config.appearance_hard_gate = 0.50  # 外观硬门控
+    tracker.tracker.multi_frame_config.uncertainty_norm = float(os.getenv('L25_UNCERTAINTY_NORM', '12.0'))
+    tracker.tracker.multi_frame_config.velocity_confidence_floor = float(os.getenv('L25_VELOCITY_CONF_FLOOR', '0.25'))
+    tracker.tracker.multi_frame_config.enable_confidence_aware_motion_l25 = enable_recovery_branch and os.getenv('L25_ENABLE_MOTION_RELIABILITY', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    tracker.tracker.multi_frame_config.l25_motion_reliability_mode = os.getenv('L25_MOTION_RELIABILITY_MODE', 'manual').strip().lower()
+    tracker.tracker.multi_frame_config.l25_motion_reliability_model_path = os.getenv('L25_MOTION_RELIABILITY_MODEL', '').strip()
+    tracker.tracker.multi_frame_config.l25_motion_reliability_bias = float(os.getenv('L25_MOTION_RELIABILITY_BIAS', '-0.1'))
+    tracker.tracker.multi_frame_config.l25_motion_reliability_score_gain = float(os.getenv('L25_MOTION_RELIABILITY_SCORE_GAIN', '2.0'))
+    tracker.tracker.multi_frame_config.l25_motion_reliability_uncertainty_gain = float(os.getenv('L25_MOTION_RELIABILITY_UNCERTAINTY_GAIN', '2.0'))
+    tracker.tracker.multi_frame_config.l25_velocity_share_min = float(os.getenv('L25_VEL_SHARE_MIN', '0.05'))
+    tracker.tracker.multi_frame_config.l25_velocity_share_max = float(os.getenv('L25_VEL_SHARE_MAX', '0.30'))
+    tracker.tracker.multi_frame_config.l25_velocity_geom_center = float(os.getenv('L25_VEL_GEOM_CENTER', '0.30'))
+    tracker.tracker.multi_frame_config.l25_velocity_geom_gain = float(os.getenv('L25_VEL_GEOM_GAIN', '10.0'))
+    tracker.tracker.multi_frame_config.l25_velocity_motion_center = float(os.getenv('L25_VEL_MOTION_CENTER', '0.65'))
+    tracker.tracker.multi_frame_config.l25_velocity_motion_gain = float(os.getenv('L25_VEL_MOTION_GAIN', '8.0'))
+    tracker.tracker.multi_frame_config.l25_velocity_reliability_strength = float(os.getenv('L25_VEL_RELIABILITY_STRENGTH', '0.60'))
     tracker.tracker.multi_frame_config.verbose = False  # 关闭调试输出
     tracker.tracker.multi_frame_config.use_l25_memory_bank_appearance = False
+    tracker.tracker.multi_frame_config.geometry_mode = l25_geometry_mode
     tracker.tracker.multi_frame_config.use_rotated_geom_in_l25 = False
     tracker.tracker.multi_frame_config.rotated_geom_weight_l25 = 0.10
     tracker.tracker.multi_frame_config.memory_bank_size = 3
@@ -375,8 +484,48 @@ def main():
     tracker.tracker.multi_frame_config.candidate_min_size_ratio = 0.55
     tracker.tracker.multi_frame_config.candidate_max_center_dist_base = 2.0
     tracker.tracker.multi_frame_config.candidate_max_center_dist_per_dt = 0.35
+    tracker.tracker.multi_frame_config.enable_candidate_diag_log = os.getenv('L25_CANDIDATE_DIAG', '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    tracker.tracker.multi_frame_config.candidate_diag_log_path = os.path.join('logs', 'l25_candidate_diag.log')
     print(
-        '[L4 Handover] tempered={} hits_center={} age_center={} score_threshold={}'.format(
+        '[L2.5 Geometry] mode={} uncertainty_norm={} vel_conf_floor={}'.format(
+            tracker.tracker.multi_frame_config.geometry_mode,
+            tracker.tracker.multi_frame_config.uncertainty_norm,
+            tracker.tracker.multi_frame_config.velocity_confidence_floor,
+        )
+    )
+    print(
+        '[L2.5 MotionRedistribute] reliability={} mode={} vel_share_min={} vel_share_max={} geom_center={} motion_center={}'.format(
+            tracker.tracker.multi_frame_config.enable_confidence_aware_motion_l25,
+            tracker.tracker.multi_frame_config.l25_motion_reliability_mode,
+            tracker.tracker.multi_frame_config.l25_velocity_share_min,
+            tracker.tracker.multi_frame_config.l25_velocity_share_max,
+            tracker.tracker.multi_frame_config.l25_velocity_geom_center,
+            tracker.tracker.multi_frame_config.l25_velocity_motion_center,
+        )
+    )
+    print(
+        '[Recovery Branch] enabled={} l15={} l25={}'.format(
+            enable_recovery_branch,
+            tracker.tracker.velocity_backtrack_enabled,
+            tracker.tracker.multi_frame_config.enable_multi_frame_backtrack,
+        )
+    )
+    tracker.tracker.enable_l4_identity_takeover = enable_l4_takeover
+    tracker.tracker.enable_l4_identity_tempering = True
+    tracker.tracker.enable_l4_handover_diag_log = os.getenv('L4_HANDOVER_DIAG', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+    tracker.tracker.l4_handover_diag_log_path = os.path.join('logs', 'l4_handover_diag.log')
+    tracker.tracker.l4_handover_hits_center = float(
+        os.getenv('L4_HANDOVER_HITS_CENTER', str(tracker.tracker.l4_handover_hits_center))
+    )
+    if not enable_l4_takeover:
+        tracker.tracker.l4_handover_score_threshold = 2.0
+    else:
+        tracker.tracker.l4_handover_score_threshold = float(
+            os.getenv('L4_HANDOVER_SCORE_THRESHOLD', str(tracker.tracker.l4_handover_score_threshold))
+        )
+    print(
+        '[L4 Handover] takeover={} tempered={} hits_center={} age_center={} score_threshold={}'.format(
+            tracker.tracker.enable_l4_identity_takeover,
             tracker.tracker.enable_l4_identity_tempering,
             tracker.tracker.l4_handover_hits_center,
             tracker.tracker.l4_handover_age_center,
@@ -397,11 +546,26 @@ def main():
         open(tracker.tracker.l15_motion_diag_log_path, 'w', encoding='utf-8').close()
     if tracker.tracker.enable_l12_defer_diag_log:
         open(tracker.tracker.l12_defer_diag_log_path, 'w', encoding='utf-8').close()
+    if tracker.tracker.multi_frame_config.enable_candidate_diag_log:
+        open(tracker.tracker.multi_frame_config.candidate_diag_log_path, 'w', encoding='utf-8').close()
+    if tracker.tracker.enable_l4_handover_diag_log:
+        open(tracker.tracker.l4_handover_diag_log_path, 'w', encoding='utf-8').close()
     
     # Iterate through each data set 遍历数据集
+    seq_filter = get_env_list('SEQ_FILTER')
+    max_frame_override = get_env_int('MAX_FRAME', None)
+
     for seq_file_3D in detection_file_list_3D:
         seq_filename_txt, seq_id, _ = fileparts(seq_file_3D)
+        if seq_filter is not None and seq_id not in seq_filter:
+            continue
         tracker.tracker.multi_frame_config.current_seq_id = seq_id
+        gt_by_frame = {}
+        if 'train' in parts or 'training' in parts:
+            gt_by_frame = load_kitti_tracking_gt_by_frame(
+                os.path.join(data_root, 'label_02', f'{seq_id}.txt'),
+                allowed_classes={'Car', 'Van'},
+            )
         print('--------------Start processing the {} dataset--------------'.format(seq_id))
         total_image = 0  # Record the total frames in this dataset记录此数据集的总帧数
         # Find matching 2D detection file by sequence id
@@ -447,9 +611,12 @@ def main():
             seq_dets_2D = seq_dets_2D.reshape(1, -1)
 
         min_frame, max_frame = int(seq_dets_3D[:, 0].min()), len(image_filenames)
+        if max_frame_override is not None:
+            max_frame = min(max_frame, int(max_frame_override))
 
         for frame, img0_path in zip(range(min_frame, max_frame + 1), image_filenames):
             tracker.tracker.multi_frame_config.current_data_frame = frame
+            tracker.current_gt_frame_entries = gt_by_frame.get(frame, [])
             img_0 = cv2.imread(img0_path)
             _, img0_name, _ = fileparts(img0_path)
             dets_3D_camera = seq_dets_3D[seq_dets_3D[:, 0] == frame, 7:14]  # 3D bounding box(h,w,l,x,y,z,theta)
@@ -525,6 +692,16 @@ def main():
                                 )
                             )
                         #show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq,line_thickness=1)  # 禁用可视化（LiDAR坐标）
+                        show_image_with_boxes(img_vis, bbox3d_tmp, image_path, color, img0_name, label, calib_file_seq, line_thickness=1)
+                        plot_one_box(
+                            np.array([id_tmp, bbox2d_tmp_trk[0], bbox2d_tmp_trk[1], bbox2d_tmp_trk[2], bbox2d_tmp_trk[3]]),
+                            img_vis,
+                            image_path,
+                            color,
+                            img0_name,
+                            label,
+                            line_thickness=1,
+                        )
             #if len(trackers_2d) > 0:
                 #for d in trackers_2d:
                     #bbox2d = d.flatten()
